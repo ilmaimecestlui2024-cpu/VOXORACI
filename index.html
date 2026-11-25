@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="fr" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      (function () {
+        try {
+          var d = Object.getOwnPropertyDescriptor(window, 'fetch');
+          if (d && d.configurable && d.get && !d.set) {
+            var currentFetch = d.get.call(window);
+            Object.defineProperty(window, 'fetch', {
+              configurable: true,
+              enumerable: d.enumerable,
+              get: function () { return currentFetch; },
+              set: function (v) { currentFetch = v; }
+            });
+          }
+        } catch (_) {}
+        window.addEventListener('error', function (e) {
+          var src = e && (e.filename || (e.error && e.error.stack) || '');
+          if (typeof src === 'string' && (src.indexOf('chrome-extension://') !== -1 || src.indexOf('moz-extension://') === 0)) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+          }
+        }, true);
+      })();
+    </script>
+    <title>Voxora Studio — Studio Vocal, Mixage & Mastering</title>
+    <meta name="description" content="Studio mobile et web d'enregistrement vocal, auto-tune YIN, multi-piste illimité, mixage et mastering en direct avec export WAV 16/24-bit." />
+    <meta property="og:title" content="Voxora Studio — Studio Vocal, Mixage & Mastering" />
+    <meta property="og:description" content="Studio vocal complet : auto-tune YIN, formant, de-esser, doubler, multi-piste illimité et suite de mastering." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  </head>
+  <body class="bg-[#F4F6FA] dark:bg-[#0B0F1A] text-slate-900 dark:text-slate-100 antialiased selection:bg-[#FFB347]/30">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

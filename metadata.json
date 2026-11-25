@@ -1,0 +1,6 @@
+{
+  "name": "Voxora Live",
+  "description": "Studio vocal auto-tune en direct à latence ultra-faible : détection de hauteur YIN, correction vers la gamme, effets de studio et enregistrement WAV.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

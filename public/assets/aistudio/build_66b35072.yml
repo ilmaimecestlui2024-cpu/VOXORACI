@@ -1,0 +1,56 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: "3.27.4"
+          cache: true
+
+      # Si les fichiers ont été envoyés « à plat » (depuis un téléphone), on les range.
+      - name: Ranger les fichiers
+        run: |
+          mkdir -p lib tools android/app/src/main/cpp
+          [ -f main.dart ] && mv main.dart lib/main.dart || true
+          [ -f voxora.cpp ] && mv voxora.cpp android/app/src/main/cpp/voxora.cpp || true
+          [ -f CMakeLists.txt ] && mv CMakeLists.txt android/app/src/main/cpp/CMakeLists.txt || true
+          [ -f setup_android.py ] && mv setup_android.py tools/setup_android.py || true
+          ls -R lib tools android | head -30
+
+      # Le dépôt ne contient que le code de Voxora : Flutter génère le reste d'Android.
+      - name: Générer le projet Android
+        run: |
+          cp lib/main.dart /tmp/main.dart
+          cp pubspec.yaml /tmp/pubspec.yaml
+          flutter create --platforms=android --project-name voxora --org com.voxora .
+          cp /tmp/main.dart lib/main.dart
+          cp /tmp/pubspec.yaml pubspec.yaml
+
+      - name: Brancher le moteur C++ (Oboe)
+        run: python3 tools/setup_android.py
+
+      - run: flutter pub get
+
+      - name: Compiler l'APK
+        run: flutter build apk --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voxora-apk
+          path: build/app/outputs/flutter-apk/app-release.apk

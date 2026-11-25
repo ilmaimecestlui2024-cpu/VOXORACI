@@ -1,0 +1,603 @@
+// Voxora Studio — Real-Time AudioWorklet Vocal DSP Engine
+// Noise Gate -> YIN Auto-Tune + Cubic Pitch Shifter -> Formant -> De-Esser
+// -> 3-Band RBJ EQ -> Compressor -> Doubler/Chorus -> Stereo Reverb -> Stereo Delay
+
+class Biquad {
+  constructor() {
+    this.b0 = 1;
+    this.b1 = 0;
+    this.b2 = 0;
+    this.a1 = 0;
+    this.a2 = 0;
+    this.z1 = 0;
+    this.z2 = 0;
+  }
+
+  reset() {
+    this.z1 = 0;
+    this.z2 = 0;
+  }
+
+  run(x) {
+    const y = this.b0 * x + this.z1;
+    this.z1 = this.b1 * x - this.a1 * y + this.z2;
+    this.z2 = this.b2 * x - this.a2 * y;
+    return y;
+  }
+
+  set(type, fs, f0, db, q) {
+    const freq = Math.max(20, Math.min(fs * 0.45, f0));
+    const qSafe = Math.max(0.1, q);
+    const A = Math.pow(10, db / 40);
+    const w = (6.28318530718 * freq) / fs;
+    const c = Math.cos(w);
+    const s = Math.sin(w);
+    const al = s / (2 * qSafe);
+    const sq = 2 * Math.sqrt(A) * al;
+    let B0 = 1, B1 = 0, B2 = 0, A0 = 1, A1 = 0, A2 = 0;
+
+    if (type === 0) {
+      B0 = A * (A + 1 - (A - 1) * c + sq);
+      B1 = 2 * A * (A - 1 - (A + 1) * c);
+      B2 = A * (A + 1 - (A - 1) * c - sq);
+      A0 = A + 1 + (A - 1) * c + sq;
+      A1 = -2 * (A - 1 + (A + 1) * c);
+      A2 = A + 1 + (A - 1) * c - sq;
+    } else if (type === 1) {
+      B0 = 1 + al * A;
+      B1 = -2 * c;
+      B2 = 1 - al * A;
+      A0 = 1 + al / A;
+      A1 = -2 * c;
+      A2 = 1 - al / A;
+    } else if (type === 2) {
+      B0 = A * (A + 1 + (A - 1) * c + sq);
+      B1 = -2 * A * (A - 1 + (A + 1) * c);
+      B2 = A * (A + 1 + (A - 1) * c - sq);
+      A0 = A + 1 - (A - 1) * c + sq;
+      A1 = 2 * (A - 1 - (A + 1) * c);
+      A2 = A + 1 - (A - 1) * c - sq;
+    } else if (type === 3) {
+      B0 = (1 + c) * 0.5;
+      B1 = -(1 + c);
+      B2 = (1 + c) * 0.5;
+      A0 = 1 + al;
+      A1 = -2 * c;
+      A2 = 1 - al;
+    } else {
+      B0 = al;
+      B1 = 0;
+      B2 = -al;
+      A0 = 1 + al;
+      A1 = -2 * c;
+      A2 = 1 - al;
+    }
+
+    this.b0 = B0 / A0;
+    this.b1 = B1 / A0;
+    this.b2 = B2 / A0;
+    this.a1 = A1 / A0;
+    this.a2 = A2 / A0;
+  }
+}
+
+class CombFilter {
+  constructor(size) {
+    this.buf = new Float32Array(Math.max(16, size));
+    this.idx = 0;
+    this.lp = 0;
+  }
+  clear() {
+    this.buf.fill(0);
+    this.idx = 0;
+    this.lp = 0;
+  }
+  run(x, fb, damp) {
+    const y = this.buf[this.idx];
+    this.lp = y * (1 - damp) + this.lp * damp;
+    this.buf[this.idx] = x + this.lp * fb;
+    if (++this.idx >= this.buf.length) this.idx = 0;
+    return y;
+  }
+}
+
+class AllpassFilter {
+  constructor(size) {
+    this.buf = new Float32Array(Math.max(16, size));
+    this.idx = 0;
+  }
+  clear() {
+    this.buf.fill(0);
+    this.idx = 0;
+  }
+  run(x) {
+    const y = this.buf[this.idx];
+    this.buf[this.idx] = x + y * 0.5;
+    if (++this.idx >= this.buf.length) this.idx = 0;
+    return -x + y;
+  }
+}
+
+const RING_SIZE = 65536;
+const RING_MASK = RING_SIZE - 1;
+
+class VoxoraStudioProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    const sr = sampleRate || 48000;
+    this.sr = sr;
+    this.N = Math.max(256, Math.round(0.04 * sr));
+    this.H = this.N >> 1;
+
+    // Vocal parameters
+    this.key = 0;
+    this.mask = 0xfff;
+    this.tuneAmt = 0.65;
+    this.tuneSpeed = 0.5;
+    this.transpose = 0.0;
+    this.formant = 0.0;
+
+    this.gateThreshDb = -52;
+    this.gateAttackMs = 5;
+    this.gateReleaseMs = 120;
+
+    this.deesser = 0.25;
+    this.eqLowDb = 2.0;
+    this.eqMidDb = 3.0;
+    this.eqMidFreq = 3200;
+    this.eqHighDb = 4.0;
+
+    this.compThreshDb = -18;
+    this.compRatio = 3.5;
+    this.compAttackMs = 5;
+    this.compReleaseMs = 140;
+    this.compMakeupDb = 3;
+
+    this.doubler = 0.15;
+    this.reverbSize = 0.55;
+    this.reverbMix = 0.22;
+    this.delayMs = 260;
+    this.delayFb = 0.35;
+    this.delayMix = 0.0;
+    this.bypass = false;
+
+    // Recording (raw dry capture so user can tweak FX post-take!)
+    this.recording = false;
+    this.recBatch = new Float32Array(2048);
+    this.recBatchIdx = 0;
+
+    // Pitch / YIN buffers
+    this.hist = new Float32Array(RING_SIZE);
+    this.wp = 0;
+    this.sh = 0;
+    this.ph = 0;
+    this.sm = 0;
+    this.ss = 0;
+    this.pk = 0;
+    this.mi = 0;
+    this.mh = new Float32Array(5);
+
+    this.D = Math.max(2, Math.round(sr / 12000));
+    this.W = 512;
+    this.tMax = Math.min(480, Math.floor(sr / this.D / 75));
+    this.tMin = Math.max(2, Math.floor(sr / this.D / 850));
+    this.L = this.W + this.tMax + 1;
+    this.ds = new Float32Array(1200);
+    this.yin = new Float32Array(512);
+
+    // Envelopes & filters
+    this.hpIn = new Biquad();
+    this.hpIn.set(3, sr, 75, 0, 0.707);
+    this.deessDet = new Biquad();
+    this.deessDet.set(4, sr, 6800, 0, 1.4);
+    this.deessCut = new Biquad();
+    this.eqL = new Biquad();
+    this.eqM = new Biquad();
+    this.eqH = new Biquad();
+    this.fmt1 = new Biquad();
+    this.fmt2 = new Biquad();
+
+    this.cb = 1e9;
+    this.cm = 1e9;
+    this.cmf = 1e9;
+    this.ch = 1e9;
+    this.cfmt = 1e9;
+    this.updateFilters();
+
+    this.gateEnv = 0;
+    this.gateGain = 1;
+    this.compEnv = 0;
+    this.deessEnv = 0;
+
+    const dSize = Math.round(0.06 * sr) + 64;
+    this.dblBufL = new Float32Array(dSize);
+    this.dblBufR = new Float32Array(dSize);
+    this.dblWp = 0;
+    this.dblPhase = 0;
+
+    const sc = sr / 44100;
+    const csL = [1557, 1617, 1491, 1422];
+    const csR = [1580, 1642, 1514, 1445];
+    const as = [225, 556];
+    this.combsL = csL.map((c) => new CombFilter(Math.round(c * sc)));
+    this.combsR = csR.map((c) => new CombFilter(Math.round(c * sc)));
+    this.apsL = as.map((a) => new AllpassFilter(Math.round(a * sc)));
+    this.apsR = as.map((a) => new AllpassFilter(Math.round(a * sc)));
+
+    this.delayMax = sr * 2;
+    this.delayBufL = new Float32Array(this.delayMax);
+    this.delayBufR = new Float32Array(this.delayMax);
+    this.delayWp = 0;
+
+    // Telemetry
+    this.detNote = 0;
+    this.corNote = 0;
+    this.voiced = false;
+    this.inPk = 0;
+    this.grDb = 0;
+    this.telemCountdown = 0;
+
+    this.port.onmessage = (e) => {
+      const m = e.data;
+      if (!m) return;
+      if (m.type === 'params') {
+        Object.assign(this, m.data);
+      } else if (m.type === 'rec') {
+        const nextRec = Boolean(m.on);
+        if (this.recording && !nextRec && this.recBatchIdx > 0) {
+          const tail = this.recBatch.slice(0, this.recBatchIdx);
+          this.port.postMessage({ type: 'rec-chunk', samples: tail }, [tail.buffer]);
+          this.recBatchIdx = 0;
+        }
+        this.recording = nextRec;
+      } else if (m.type === 'reset') {
+        this.hist.fill(0);
+        this.mh.fill(0);
+        this.dblBufL.fill(0);
+        this.dblBufR.fill(0);
+        this.delayBufL.fill(0);
+        this.delayBufR.fill(0);
+        this.combsL.forEach((c) => c.clear());
+        this.combsR.forEach((c) => c.clear());
+        this.apsL.forEach((a) => a.clear());
+        this.apsR.forEach((a) => a.clear());
+        this.sm = 0;
+        this.ss = 0;
+        this.pk = 0;
+        this.detNote = 0;
+        this.corNote = 0;
+      }
+    };
+  }
+
+  updateFilters() {
+    if (
+      this.eqLowDb !== this.cb ||
+      this.eqMidDb !== this.cm ||
+      this.eqMidFreq !== this.cmf ||
+      this.eqHighDb !== this.ch
+    ) {
+      this.cb = this.eqLowDb;
+      this.cm = this.eqMidDb;
+      this.cmf = this.eqMidFreq;
+      this.ch = this.eqHighDb;
+      this.eqL.set(0, this.sr, 150, this.cb, 0.707);
+      this.eqM.set(1, this.sr, this.cmf, this.cm, 0.9);
+      this.eqH.set(2, this.sr, 9500, this.ch, 0.707);
+    }
+    if (this.formant !== this.cfmt) {
+      this.cfmt = this.formant;
+      const fShift = Math.pow(2, this.cfmt / 12);
+      const fTarget = Math.max(320, Math.min(2800, 950 * fShift));
+      this.fmt1.set(1, this.sr, fTarget, this.cfmt * 0.55, 1.1);
+      this.fmt2.set(2, this.sr, 2600, this.cfmt * 0.45, 0.707);
+    }
+  }
+
+  rd(d) {
+    const id = d | 0;
+    const fr = d - id;
+    const cur = (this.wp - 2) >>> 0;
+    const y0 = this.hist[(cur - id + 1) & RING_MASK];
+    const y1 = this.hist[(cur - id) & RING_MASK];
+    const y2 = this.hist[(cur - id - 1) & RING_MASK];
+    const y3 = this.hist[(cur - id - 2) & RING_MASK];
+    const c0 = y1;
+    const c1 = 0.5 * (y2 - y0);
+    const c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
+    const c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);
+    return ((c3 * fr + c2) * fr + c1) * fr + c0;
+  }
+
+  pitchShift() {
+    this.ss += (this.sm - this.ss) * 0.004;
+    const mix = Math.min(1, Math.abs(this.ss) * 3);
+    const dry = this.hist[(this.wp - 2 - this.H) & RING_MASK];
+    if (mix < 0.001 && Math.abs(this.transpose) < 0.01) return dry;
+
+    const r = Math.pow(2, this.ss / 12);
+    this.ph += (1 - r) / this.N;
+    this.ph -= Math.floor(this.ph);
+    let f2 = this.ph + 0.5;
+    if (f2 >= 1) f2 -= 1;
+
+    let w1 = Math.sin(3.14159265359 * this.ph);
+    w1 *= w1;
+    const wet = this.rd(this.ph * this.N) * w1 + this.rd(f2 * this.N) * (1 - w1);
+    return dry * (1 - mix) + wet * mix;
+  }
+
+  analyze() {
+    const D = this.D;
+    const W = this.W;
+    const tMax = this.tMax;
+    const tMin = this.tMin;
+    const L = this.L;
+    if (L > 1200 || tMax + 2 > 512) return;
+
+    const base = (this.wp - L * D) >>> 0;
+    for (let k = 0; k < L; k++) {
+      let s = 0;
+      const offset = base + k * D;
+      for (let j = 0; j < D; j++) s += this.hist[(offset + j) & RING_MASK];
+      this.ds[k] = s / D;
+    }
+
+    let e = 0;
+    for (let j = 0; j < W; j++) e += this.ds[j] * this.ds[j];
+    const rms = Math.sqrt(e / W);
+    this.pk = Math.max(this.pk * 0.9995, rms);
+
+    let voiced = false;
+    let m = 0;
+    const gateLin = Math.max(Math.pow(10, this.gateThreshDb / 20), 0.04 * this.pk);
+
+    if (rms >= gateLin) {
+      let run = 0;
+      for (let t = 1; t <= tMax; t++) {
+        let a = 0;
+        for (let j = 0; j < W; j++) {
+          const q = this.ds[j] - this.ds[j + t];
+          a += q * q;
+        }
+        run += a;
+        this.yin[t] = (a * t) / (run > 0 ? run : 1);
+      }
+      let t = tMin;
+      while (t < tMax) {
+        if (this.yin[t] < 0.15) {
+          while (t + 1 < tMax && this.yin[t + 1] < this.yin[t]) t++;
+          break;
+        }
+        t++;
+      }
+      if (t < tMax) {
+        const a = this.yin[t - 1];
+        const b = this.yin[t];
+        const c = this.yin[t + 1];
+        const den = a - 2 * b + c;
+        const tt = den !== 0 ? t + (a - c) / (2 * den) : t;
+        const freq = this.sr / D / tt;
+        if (freq > 65 && freq < 950) {
+          m = 69 + 12 * Math.log2(freq / 440);
+          voiced = true;
+        }
+      }
+    }
+
+    this.mh[this.mi++ % 5] = voiced ? m : 0;
+    const v = [];
+    for (let i = 0; i < 5; i++) {
+      if (this.mh[i] > 0) v.push(this.mh[i]);
+    }
+    if (!voiced || v.length < 2) {
+      voiced = false;
+    } else {
+      v.sort((a, b) => a - b);
+      m = v[v.length >> 1];
+    }
+
+    let want = this.transpose;
+    let al = 0.15;
+    if (voiced) {
+      const b0 = Math.round(m);
+      let best = m;
+      let bd = 1e9;
+      for (let k = -6; k <= 6; k++) {
+        const cn = b0 + k;
+        const rel = (((cn - this.key) % 12) + 12) % 12;
+        if ((this.mask >> rel) & 1) {
+          const dd = Math.abs(cn - m);
+          if (dd < bd) {
+            bd = dd;
+            best = cn;
+          }
+        }
+      }
+      want = (best - m) * this.tuneAmt + this.transpose;
+      al = 0.04 + 0.96 * this.tuneSpeed * this.tuneSpeed;
+    }
+
+    al = 1 - Math.sqrt(1 - Math.max(0.01, Math.min(0.999, al)));
+    this.sm += (want - this.sm) * al;
+    this.voiced = voiced;
+    this.detNote = voiced ? m : 0;
+    this.corNote = voiced ? m + this.sm : 0;
+  }
+
+  process(inputs, outputs) {
+    const input = inputs[0];
+    const output = outputs[0];
+    if (!output || output.length === 0) return true;
+
+    const outL = output[0];
+    const outR = output.length > 1 ? output[1] : outL;
+    const inCh = input && input.length > 0 ? input[0] : null;
+    const n = outL.length;
+
+    this.updateFilters();
+
+    const gAtk = 1 - Math.exp(-1 / (Math.max(0.5, this.gateAttackMs) * 0.001 * this.sr));
+    const gRel = 1 - Math.exp(-1 / (Math.max(5, this.gateReleaseMs) * 0.001 * this.sr));
+    const gateThr = Math.pow(10, this.gateThreshDb / 20);
+
+    const cAtk = 1 - Math.exp(-1 / (Math.max(0.5, this.compAttackMs) * 0.001 * this.sr));
+    const cRel = 1 - Math.exp(-1 / (Math.max(10, this.compReleaseMs) * 0.001 * this.sr));
+    const makeupLin = Math.pow(10, this.compMakeupDb / 20);
+
+    const dSize = this.dblBufL.length;
+    const delSmp = Math.max(64, Math.min(this.delayMax - 2, Math.round(this.delayMs * 0.001 * this.sr)));
+    const fb = Math.max(0, Math.min(0.85, this.delayFb));
+    const revFb = 0.72 + this.reverbSize * 0.2;
+
+    for (let i = 0; i < n; i++) {
+      const rawIn = inCh ? inCh[i] : 0;
+      const absRaw = Math.abs(rawIn);
+      if (absRaw > this.inPk) this.inPk = absRaw;
+
+      if (this.recording) {
+        this.recBatch[this.recBatchIdx++] = rawIn;
+        if (this.recBatchIdx >= this.recBatch.length) {
+          const copy = this.recBatch.slice();
+          this.port.postMessage({ type: 'rec-chunk', samples: copy }, [copy.buffer]);
+          this.recBatchIdx = 0;
+        }
+      }
+
+      if (this.bypass) {
+        outL[i] = rawIn;
+        if (outR !== outL) outR[i] = rawIn;
+        this.grDb = 0;
+        continue;
+      }
+
+      // 1. HPF & Noise Gate
+      let x = this.hpIn.run(rawIn);
+      const ax = Math.abs(x);
+      this.gateEnv += (ax - this.gateEnv) * (ax > this.gateEnv ? gAtk : gRel);
+      const tg = this.gateEnv >= gateThr ? 1 : 0.02;
+      this.gateGain += (tg - this.gateGain) * (tg > this.gateGain ? gAtk : gRel);
+      x *= this.gateGain;
+
+      // 2. Pitch analysis & shifter
+      this.hist[this.wp & RING_MASK] = x;
+      this.wp = (this.wp + 1) >>> 0;
+      if (++this.sh >= 256) {
+        this.sh = 0;
+        this.analyze();
+      }
+      let y = this.pitchShift();
+
+      // 3. Formant
+      if (Math.abs(this.formant) > 0.1) {
+        y = this.fmt2.run(this.fmt1.run(y));
+      }
+
+      // 4. De-Esser
+      if (this.deesser > 0.01) {
+        const sib = Math.abs(this.deessDet.run(y));
+        this.deessEnv += (sib - this.deessEnv) * (sib > this.deessEnv ? 0.02 : 0.001);
+        const thr = 0.05 * (1.1 - this.deesser * 0.85);
+        let cutDb = 0;
+        if (this.deessEnv > thr) {
+          const overDb = 20 * Math.log10((this.deessEnv + 1e-7) / (thr + 1e-7));
+          cutDb = -Math.max(0, Math.min(14, overDb * 1.4 * this.deesser));
+        }
+        this.deessCut.set(2, this.sr, 6200, cutDb, 0.707);
+        y = this.deessCut.run(y);
+      }
+
+      // 5. 3-Band EQ
+      y = this.eqH.run(this.eqM.run(this.eqL.run(y)));
+
+      // 6. Compressor
+      const ay = Math.abs(y);
+      this.compEnv += (ay - this.compEnv) * (ay > this.compEnv ? cAtk : cRel);
+      const over = 20 * Math.log10(this.compEnv + 1e-7) - this.compThreshDb;
+      const gr = over > 0 ? -over * (1 - 1 / Math.max(1, this.compRatio)) : 0;
+      this.grDb = gr;
+      y *= Math.pow(10, gr / 20) * makeupLin;
+
+      // 7. Doubler / Chorus
+      let yL = y;
+      let yR = y;
+      this.dblBufL[this.dblWp] = y;
+      this.dblBufR[this.dblWp] = y;
+      if (this.doubler > 0.01) {
+        this.dblPhase += 0.65 / this.sr;
+        if (this.dblPhase >= 1) this.dblPhase -= 1;
+        const lfo = Math.sin(6.28318530718 * this.dblPhase);
+        const d1 = (0.014 + 0.004 * lfo) * this.sr;
+        const d2 = (0.021 - 0.004 * lfo) * this.sr;
+        const readDbl = (buf, d) => {
+          const id = d | 0;
+          const fr = d - id;
+          const i1 = (this.dblWp - id + dSize) % dSize;
+          const i2 = (this.dblWp - id - 1 + dSize) % dSize;
+          return buf[i1] * (1 - fr) + buf[i2] * fr;
+        };
+        const wL = readDbl(this.dblBufL, d1);
+        const wR = readDbl(this.dblBufR, d2);
+        const m = this.doubler * 0.6;
+        yL = yL * (1 - m * 0.35) + wL * m;
+        yR = yR * (1 - m * 0.35) + wR * m;
+      }
+      if (++this.dblWp >= dSize) this.dblWp = 0;
+
+      // 8. Stereo Reverb
+      let fxL = 0;
+      let fxR = 0;
+      if (this.reverbMix > 0.01) {
+        let sL = 0;
+        let sR = 0;
+        for (let k = 0; k < 4; k++) {
+          sL += this.combsL[k].run(yL, revFb, 0.32);
+          sR += this.combsR[k].run(yR, revFb, 0.32);
+        }
+        sL *= 0.25;
+        sR *= 0.25;
+        for (let k = 0; k < 2; k++) {
+          sL = this.apsL[k].run(sL);
+          sR = this.apsR[k].run(sR);
+        }
+        fxL += sL * this.reverbMix * 0.55;
+        fxR += sR * this.reverbMix * 0.55;
+      }
+
+      // 9. Stereo Delay
+      const rIdx = (this.delayWp - delSmp + this.delayMax) % this.delayMax;
+      const eL = this.delayBufL[rIdx];
+      const eR = this.delayBufR[rIdx];
+      this.delayBufL[this.delayWp] = yL + eR * fb;
+      this.delayBufR[this.delayWp] = yR + eL * fb;
+      if (++this.delayWp >= this.delayMax) this.delayWp = 0;
+
+      if (this.delayMix > 0.01) {
+        fxL += eL * this.delayMix * 0.6;
+        fxR += eR * this.delayMix * 0.6;
+      }
+
+      outL[i] = yL + fxL;
+      if (outR !== outL) outR[i] = yR + fxR;
+    }
+
+    this.telemCountdown += n;
+    if (this.telemCountdown >= 1280) {
+      this.port.postMessage({
+        type: 'telemetry',
+        det: this.detNote,
+        cor: this.corNote,
+        voiced: this.voiced,
+        inPk: this.inPk,
+        grDb: this.grDb,
+        sr: this.sr,
+      });
+      this.inPk = 0;
+      this.telemCountdown = 0;
+    }
+
+    return true;
+  }
+}
+
+registerProcessor('voxora-processor', VoxoraStudioProcessor);
