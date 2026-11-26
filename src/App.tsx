@@ -89,7 +89,7 @@ export default function App() {
   const [sourceMode, setSourceMode] = useState<VocalSourceMode>('mic');
   const [devices, setDevices] = useState<AudioInputDevice[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState('');
-  const [monitor, setMonitor] = useState(true);
+  const [monitor, setMonitor] = useState(false);
 
   const [vocal, setVocal] = useState<VocalSettings>(DEFAULT_VOCAL_SETTINGS);
   const [master, setMaster] = useState<MasterSettings>(DEFAULT_MASTER_SETTINGS);
@@ -194,6 +194,17 @@ export default function App() {
     return true;
   };
 
+  const ensurePlaybackEngine = async (): Promise<boolean> => {
+    if (live) return true;
+    setErrorMsg(null);
+    const res = await engine.ensurePlaybackReady();
+    if (!res.ok) {
+      setErrorMsg(res.error ?? 'Impossible de démarrer la lecture audio.');
+      return false;
+    }
+    return true;
+  };
+
   const toggleLiveEngine = async () => {
     if (live) {
       if (isRecording) await toggleRecord();
@@ -241,6 +252,7 @@ export default function App() {
   const handleTrackDelete = (id: string) => {
     setTracks((prev) => {
       const next = prev.filter((t) => t.id !== id);
+      engine.syncTracks(next);
       if (isPlaying) {
         if (next.length === 0) {
           engine.stopPlayback();
@@ -258,7 +270,7 @@ export default function App() {
       setErrorMsg('Importe au moins un instrumental ou enregistre une voix.');
       return;
     }
-    if (!(await ensureLiveEngine())) return;
+    if (!(await ensurePlaybackEngine())) return;
     if (isPlaying) {
       engine.pausePlayback();
       setIsPlaying(false);
@@ -536,6 +548,8 @@ export default function App() {
                     type="button"
                     onClick={async () => {
                       setSourceMode('mic');
+                      setMonitor(false);
+                      engine.setMonitor(false);
                       if (live) {
                         const err = await engine.switchSource('mic', selectedDeviceId);
                         if (err) setErrorMsg(err);
@@ -554,6 +568,8 @@ export default function App() {
                     type="button"
                     onClick={async () => {
                       setSourceMode('synth');
+                      setMonitor(true);
+                      engine.setMonitor(true);
                       if (live) {
                         const err = await engine.switchSource('synth');
                         if (err) setErrorMsg(err);

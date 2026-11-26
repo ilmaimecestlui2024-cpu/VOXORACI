@@ -81,7 +81,7 @@ class _StudioWorkspacePageState extends State<StudioWorkspacePage> {
 
   int _tabIndex = 0;
   bool _engineRunning = false;
-  bool _monitorLive = true;
+  bool _monitorLive = false;
   bool _isPlaying = false;
   bool _isRecording = false;
   bool _isImporting = false;

@@ -1,5 +1,5 @@
 // Voxora Studio — Real-Time AudioWorklet Master Bus Processor
-// Master EQ -> Glue Bus Compressor -> Harmonic Exciter -> Stereo Imager -> Brickwall Limiter
+// Master EQ -> Glue Bus Compressor -> Harmonic Exciter -> Stereo Imager -> 2.5ms Lookahead Brickwall Limiter
 
 class MasterBiquad {
   constructor() {
@@ -7,9 +7,16 @@ class MasterBiquad {
     this.z1 = 0; this.z2 = 0;
   }
   run(x) {
-    const y = this.b0 * x + this.z1;
+    let y = this.b0 * x + this.z1;
     this.z1 = this.b1 * x - this.a1 * y + this.z2;
     this.z2 = this.b2 * x - this.a2 * y;
+    if (!Number.isFinite(y)) {
+      this.z1 = 0;
+      this.z2 = 0;
+      return 0;
+    }
+    if (Math.abs(this.z1) < 1e-18) this.z1 = 0;
+    if (Math.abs(this.z2) < 1e-18) this.z2 = 0;
     return y;
   }
   set(type, fs, f0, db, q) {
@@ -69,9 +76,15 @@ class VoxoraMasterProcessor extends AudioWorkletProcessor {
 
     this.atkGlue = 1 - Math.exp(-1 / (0.015 * sr));
     this.relGlue = 1 - Math.exp(-1 / (0.200 * sr));
-    this.atkLim = 1 - Math.exp(-1 / (0.0005 * sr));
-    this.relLim = 1 - Math.exp(-1 / (0.080 * sr));
     this.glueEnv = 0;
+
+    // 2.5ms Lookahead Brickwall Limiter (zero transient crackles!)
+    this.lookLen = Math.max(16, Math.round(0.0025 * sr));
+    this.lookBufL = new Float32Array(this.lookLen);
+    this.lookBufR = new Float32Array(this.lookLen);
+    this.lookIdx = 0;
+    this.atkLim = 1 - Math.exp(-1 / (0.0012 * sr));
+    this.relLim = 1 - Math.exp(-1 / (0.090 * sr));
     this.limGain = 1;
 
     this.peakHold = 0;
@@ -109,11 +122,13 @@ class VoxoraMasterProcessor extends AudioWorkletProcessor {
 
     this.updEq();
     const drive = Math.pow(10, this.limiterDriveDb / 20);
-    const ceilLin = Math.pow(10, Math.max(-6, Math.min(-0.05, this.limiterCeilingDb)) / 20);
+    const ceilLin = Math.pow(10, Math.max(-6, Math.min(-0.1, this.limiterCeilingDb)) / 20);
 
     for (let i = 0; i < n; i++) {
       let L = inL ? inL[i] : 0;
       let R = inR ? inR[i] : L;
+      if (!Number.isFinite(L)) L = 0;
+      if (!Number.isFinite(R)) R = 0;
 
       if (!this.bypass) {
         L = this.eqHighL.run(this.eqLowL.run(L));
@@ -132,8 +147,8 @@ class VoxoraMasterProcessor extends AudioWorkletProcessor {
         if (this.exciter > 0.01) {
           const hL = this.excHpL.run(L);
           const hR = this.excHpR.run(R);
-          L += Math.tanh(hL * (1 + this.exciter * 4)) * this.exciter * 0.25;
-          R += Math.tanh(hR * (1 + this.exciter * 4)) * this.exciter * 0.25;
+          L += Math.tanh(hL * (1 + this.exciter * 3)) * this.exciter * 0.2;
+          R += Math.tanh(hR * (1 + this.exciter * 3)) * this.exciter * 0.2;
         }
 
         const mid = (L + R) * 0.5;
@@ -141,14 +156,27 @@ class VoxoraMasterProcessor extends AudioWorkletProcessor {
         L = (mid + side) * drive;
         R = (mid - side) * drive;
 
+        // Soft-knee analog saturation before lookahead limiter
+        L = Math.tanh(L * 0.72) / 0.72;
+        R = Math.tanh(R * 0.72) / 0.72;
+
+        // Lookahead delay read & write
+        const delL = this.lookBufL[this.lookIdx];
+        const delR = this.lookBufR[this.lookIdx];
+        this.lookBufL[this.lookIdx] = L;
+        this.lookBufR[this.lookIdx] = R;
+        if (++this.lookIdx >= this.lookLen) this.lookIdx = 0;
+
+        // Peak detection on incoming sample ramps gain smoothly before delayed peak exits
         const spk = Math.max(Math.abs(L), Math.abs(R));
         const tg = spk > ceilLin ? ceilLin / spk : 1;
         this.limGain += (tg - this.limGain) * (tg < this.limGain ? this.atkLim : this.relLim);
-        L = Math.max(-ceilLin, Math.min(ceilLin, L * this.limGain));
-        R = Math.max(-ceilLin, Math.min(ceilLin, R * this.limGain));
+
+        L = Math.max(-ceilLin, Math.min(ceilLin, delL * this.limGain));
+        R = Math.max(-ceilLin, Math.min(ceilLin, delR * this.limGain));
       } else {
-        L = Math.max(-0.99, Math.min(0.99, L));
-        R = Math.max(-0.99, Math.min(0.99, R));
+        L = Math.tanh(L * 0.9);
+        R = Math.tanh(R * 0.9);
       }
 
       outL[i] = L;

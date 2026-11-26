@@ -63,6 +63,7 @@ const HISTORY_LEN = 220;
 
 export class VoxoraAudioEngine {
   private ctx: AudioContext | null = null;
+  private workletsLoaded = false;
   private vocalWorklet: AudioWorkletNode | null = null;
   private masterWorklet: AudioWorkletNode | null = null;
   private inputGain: GainNode | null = null;
@@ -83,16 +84,17 @@ export class VoxoraAudioEngine {
   private playStartCtxTime = 0;
   private playheadOffsetSec = 0;
 
-  // Live recording chunks (raw mic buffer -> becomes a StudioTrack on timeline!)
+  // Live recording chunks
   private recChunks: Float32Array[] = [];
   private recTotalSamples = 0;
   private isRecording = false;
   private recStartSec = 0;
+  private recLatencyCompMs = 0;
 
   // Settings
   private vocalSettings: VocalSettings = { ...DEFAULT_VOCAL_SETTINGS };
   private masterSettings: MasterSettings = { ...DEFAULT_MASTER_SETTINGS };
-  private monitorEnabled = true;
+  private monitorEnabled = false;
 
   // 60fps canvas ring buffers
   public readonly detHistory = new Float32Array(HISTORY_LEN);
@@ -128,15 +130,13 @@ export class VoxoraAudioEngine {
       }));
   }
 
-  public async ensureReady(mode: VocalSourceMode = this.sourceMode, deviceId?: string): Promise<{
+  // Initializes AudioContext + MasterWorklet + MixBus ONLY (does NOT open mic unless needed!)
+  public async ensurePlaybackReady(): Promise<{
     ok: boolean;
     error?: string;
     sampleRate: number;
     latencyMs: number;
   }> {
-    this.sourceMode = mode;
-    if (deviceId !== undefined) this.selectedDeviceId = deviceId;
-
     try {
       if (!this.ctx) {
         const AudioCtx =
@@ -148,16 +148,24 @@ export class VoxoraAudioEngine {
         await this.ctx.resume();
       }
 
-      if (!this.vocalWorklet || !this.masterWorklet) {
+      if (!this.workletsLoaded) {
         await Promise.all([
           this.ctx.audioWorklet.addModule('/worklets/voxora-processor.js'),
           this.ctx.audioWorklet.addModule('/worklets/voxora-master-processor.js'),
         ]);
+        this.workletsLoaded = true;
+      }
 
+      if (!this.masterWorklet) {
         this.inputGain = this.ctx.createGain();
+        this.inputGain.gain.value = 1.0;
+
         this.monitorGain = this.ctx.createGain();
         this.monitorGain.gain.value = this.monitorEnabled ? 1 : 0;
+
+        // -2.2 dB mix bus headroom prevents multi-track summing distortion
         this.tracksMixBus = this.ctx.createGain();
+        this.tracksMixBus.gain.value = 0.78;
 
         this.vocalWorklet = new AudioWorkletNode(this.ctx, 'voxora-processor', {
           numberOfInputs: 1,
@@ -184,8 +192,6 @@ export class VoxoraAudioEngine {
       this.pushVocalSettings();
       this.pushMasterSettings();
 
-      await this.connectSource(mode, this.selectedDeviceId);
-
       const baseLat = this.ctx.baseLatency ?? 0;
       const outLat = (this.ctx as AudioContext & { outputLatency?: number }).outputLatency ?? 0;
       const latencyMs = Math.round((baseLat + outLat) * 1000 + 20);
@@ -194,13 +200,37 @@ export class VoxoraAudioEngine {
 
       return { ok: true, sampleRate: this.ctx.sampleRate, latencyMs };
     } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Impossible d’initialiser le moteur audio.';
+      return { ok: false, error: msg, sampleRate: 48000, latencyMs: 0 };
+    }
+  }
+
+  public async ensureReady(
+    mode: VocalSourceMode = this.sourceMode,
+    deviceId?: string
+  ): Promise<{
+    ok: boolean;
+    error?: string;
+    sampleRate: number;
+    latencyMs: number;
+  }> {
+    this.sourceMode = mode;
+    if (deviceId !== undefined) this.selectedDeviceId = deviceId;
+
+    const baseRes = await this.ensurePlaybackReady();
+    if (!baseRes.ok) return baseRes;
+
+    try {
+      await this.connectSource(mode, this.selectedDeviceId);
+      return baseRes;
+    } catch (err) {
       const msg =
         err instanceof DOMException && err.name === 'NotAllowedError'
-          ? 'Accès au microphone refusé. Autorise le micro dans ton navigateur ou utilise le Synthé de test.'
+          ? 'Accès au microphone refusé. Autorise le micro dans ton navigateur ou utilise le Synthé test.'
           : err instanceof Error
           ? err.message
-          : 'Impossible d’initialiser le moteur audio.';
-      return { ok: false, error: msg, sampleRate: 48000, latencyMs: 0 };
+          : 'Impossible d’activer la capture audio.';
+      return { ok: false, error: msg, sampleRate: baseRes.sampleRate, latencyMs: baseRes.latencyMs };
     }
   }
 
@@ -221,12 +251,13 @@ export class VoxoraAudioEngine {
     if (!this.ctx || !this.inputGain) return;
 
     if (mode === 'mic') {
+      // Enable hardware/WebRTC AEC & Noise Suppression to stop instrumental bleed & weird echo loops
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           deviceId: deviceId ? { exact: deviceId } : undefined,
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
           channelCount: 1,
         },
         video: false,
@@ -314,6 +345,7 @@ export class VoxoraAudioEngine {
       this.masterWorklet.disconnect();
       this.masterWorklet = null;
     }
+    this.workletsLoaded = false;
     if (this.ctx) {
       this.ctx.close().catch(() => {});
       this.ctx = null;
@@ -325,7 +357,7 @@ export class VoxoraAudioEngine {
   public setMonitor(on: boolean) {
     this.monitorEnabled = on;
     if (this.ctx && this.monitorGain) {
-      this.monitorGain.gain.setTargetAtTime(on ? 1 : 0, this.ctx.currentTime, 0.015);
+      this.monitorGain.gain.setTargetAtTime(on ? 1 : 0, this.ctx.currentTime, 0.012);
     }
   }
 
@@ -430,7 +462,7 @@ export class VoxoraAudioEngine {
     const ch1 = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : ch0;
     const len = ch0.length;
     const step = Math.max(1, Math.floor(len / count));
-    const stride = Math.max(1, Math.floor(step / 64)); // Fast subsampled peak scan even on multi-hour files
+    const stride = Math.max(1, Math.floor(step / 64));
     const peaks: number[] = [];
     for (let i = 0; i < count; i++) {
       let mx = 0;
@@ -452,8 +484,8 @@ export class VoxoraAudioEngine {
       const node = this.activeNodes.get(t.id);
       if (node && this.ctx) {
         const audible = !t.mute && (!anySolo || t.solo);
-        node.gain.gain.setTargetAtTime(audible ? t.volume : 0, this.ctx.currentTime, 0.015);
-        node.pan.pan.setTargetAtTime(t.pan, this.ctx.currentTime, 0.015);
+        node.gain.gain.setTargetAtTime(audible ? t.volume : 0, this.ctx.currentTime, 0.012);
+        node.pan.pan.setTargetAtTime(t.pan, this.ctx.currentTime, 0.012);
       }
     }
   }
@@ -467,7 +499,7 @@ export class VoxoraAudioEngine {
       this.playheadOffsetSec = Math.max(0, fromSec);
     }
 
-    const now = this.ctx.currentTime + 0.03;
+    const now = this.ctx.currentTime + 0.025;
     this.playStartCtxTime = now - this.playheadOffsetSec;
     const anySolo = tracks.some((t) => t.solo);
 
@@ -476,8 +508,10 @@ export class VoxoraAudioEngine {
       src.buffer = t.buffer;
 
       const gain = this.ctx.createGain();
-      const audible = !t.mute && (!anySolo || t.solo);
-      gain.gain.value = audible ? t.volume : 0;
+      const targetVol = !t.mute && (!anySolo || t.solo) ? t.volume : 0;
+      // Smooth 8ms anti-click fade-in
+      gain.gain.setValueAtTime(0, now);
+      gain.gain.linearRampToValueAtTime(targetVol, now + 0.008);
 
       const pan = this.ctx.createStereoPanner();
       pan.pan.value = t.pan;
@@ -549,13 +583,29 @@ export class VoxoraAudioEngine {
   }
 
   private stopActiveTrackNodes() {
+    const ctx = this.ctx;
     this.activeNodes.forEach((n) => {
       try {
-        n.source.stop();
-        n.source.disconnect();
-        n.vocalWorklet?.disconnect();
-        n.gain.disconnect();
-        n.pan.disconnect();
+        if (ctx) {
+          const t = ctx.currentTime;
+          n.gain.gain.cancelScheduledValues(t);
+          n.gain.gain.setValueAtTime(n.gain.gain.value, t);
+          n.gain.gain.linearRampToValueAtTime(0, t + 0.008);
+          n.source.stop(t + 0.01);
+          window.setTimeout(() => {
+            try {
+              n.source.disconnect();
+              n.vocalWorklet?.disconnect();
+              n.gain.disconnect();
+              n.pan.disconnect();
+            } catch {
+              // ignore
+            }
+          }, 25);
+        } else {
+          n.source.stop();
+          n.source.disconnect();
+        }
       } catch {
         // ignore
       }
@@ -563,12 +613,26 @@ export class VoxoraAudioEngine {
     this.activeNodes.clear();
   }
 
-  // ---------- Live Vocal Recording -> Adds Directly as Multi-Track ----------
+  // ---------- Live Vocal Recording -> Synced & Latency-Compensated ----------
   public startRecording() {
     this.recChunks = [];
     this.recTotalSamples = 0;
     this.isRecording = true;
-    this.recStartSec = this.getPlayheadSec();
+
+    const baseLat = this.ctx?.baseLatency ?? 0;
+    const outLat =
+      (this.ctx as (AudioContext & { outputLatency?: number }) | null)?.outputLatency ?? 0;
+    const lookaheadPendingSec =
+      this.ctx && this.isPlaying
+        ? Math.max(0, this.playStartCtxTime + this.playheadOffsetSec - this.ctx.currentTime)
+        : 0;
+    // Compensate round-trip audio latency + pending buffer lookahead so recorded voice locks cleanly with the instrumental
+    this.recLatencyCompMs = Math.round((baseLat + outLat + lookaheadPendingSec) * 1000);
+    this.recStartSec =
+      this.ctx && this.isPlaying
+        ? Math.max(this.playheadOffsetSec, this.ctx.currentTime - this.playStartCtxTime)
+        : this.playheadOffsetSec;
+
     this.vocalWorklet?.port.postMessage({ type: 'rec', on: true });
   }
 
@@ -588,9 +652,24 @@ export class VoxoraAudioEngine {
     this.recChunks = [];
     this.recTotalSamples = 0;
 
+    // Trim leading round-trip hardware latency samples cleanly if recording started over a beat
     const sr = this.ctx.sampleRate;
-    const buffer = this.ctx.createBuffer(1, merged.length, sr);
-    buffer.copyToChannel(merged, 0);
+    const trimSamples = Math.min(
+      Math.max(0, merged.length - 256),
+      Math.round((this.recLatencyCompMs / 1000) * sr)
+    );
+    const synced = trimSamples > 0 ? merged.subarray(trimSamples) : merged;
+
+    // 10ms smooth fade-in and fade-out on recorded clip edges to guarantee zero clicks
+    const fadeLen = Math.min(synced.length >> 2, Math.round(0.01 * sr));
+    for (let i = 0; i < fadeLen; i++) {
+      const w = i / fadeLen;
+      synced[i] *= w;
+      synced[synced.length - 1 - i] *= w;
+    }
+
+    const buffer = this.ctx.createBuffer(1, synced.length, sr);
+    buffer.copyToChannel(synced, 0);
 
     return {
       id: `rec-${Date.now()}`,

@@ -1,6 +1,6 @@
-// Voxora Studio — Real-Time AudioWorklet Vocal DSP Engine
-// Noise Gate -> YIN Auto-Tune + Cubic Pitch Shifter -> Formant -> De-Esser
-// -> 3-Band RBJ EQ -> Compressor -> Doubler/Chorus -> Stereo Reverb -> Stereo Delay
+// Voxora Studio — Real-Time AudioWorklet Vocal DSP Engine (Clean, Zero-Clip, Low-Artifact)
+// DC/HPF -> Noise Gate -> YIN Auto-Tune (24ms OLA Cubic) -> Formant -> Smooth De-Esser
+// -> 3-Band RBJ EQ -> Compressor -> Doubler/Chorus -> Stereo Reverb -> Stereo Delay -> Soft Limiter
 
 class Biquad {
   constructor() {
@@ -19,9 +19,17 @@ class Biquad {
   }
 
   run(x) {
-    const y = this.b0 * x + this.z1;
+    let y = this.b0 * x + this.z1;
     this.z1 = this.b1 * x - this.a1 * y + this.z2;
     this.z2 = this.b2 * x - this.a2 * y;
+    // Anti-denormal & NaN guard
+    if (!Number.isFinite(y)) {
+      this.z1 = 0;
+      this.z2 = 0;
+      return 0;
+    }
+    if (Math.abs(this.z1) < 1e-18) this.z1 = 0;
+    if (Math.abs(this.z2) < 1e-18) this.z2 = 0;
     return y;
   }
 
@@ -95,6 +103,7 @@ class CombFilter {
   run(x, fb, damp) {
     const y = this.buf[this.idx];
     this.lp = y * (1 - damp) + this.lp * damp;
+    if (Math.abs(this.lp) < 1e-18) this.lp = 0;
     this.buf[this.idx] = x + this.lp * fb;
     if (++this.idx >= this.buf.length) this.idx = 0;
     return y;
@@ -126,7 +135,8 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
     super();
     const sr = sampleRate || 48000;
     this.sr = sr;
-    this.N = Math.max(256, Math.round(0.04 * sr));
+    // 24ms grain window for crisp vocal transients without slap-back artifacts
+    this.N = Math.max(256, Math.round(0.024 * sr));
     this.H = this.N >> 1;
 
     // Vocal parameters
@@ -161,7 +171,6 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
     this.delayMix = 0.0;
     this.bypass = false;
 
-    // Recording (raw dry capture so user can tweak FX post-take!)
     this.recording = false;
     this.recBatch = new Float32Array(2048);
     this.recBatchIdx = 0;
@@ -173,6 +182,7 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
     this.ph = 0;
     this.sm = 0;
     this.ss = 0;
+    this.wetMix = 0;
     this.pk = 0;
     this.mi = 0;
     this.mh = new Float32Array(5);
@@ -185,12 +195,11 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
     this.ds = new Float32Array(1200);
     this.yin = new Float32Array(512);
 
-    // Envelopes & filters
+    // Static filter topology (no per-sample coefficient recalculation!)
     this.hpIn = new Biquad();
-    this.hpIn.set(3, sr, 75, 0, 0.707);
-    this.deessDet = new Biquad();
-    this.deessDet.set(4, sr, 6800, 0, 1.4);
-    this.deessCut = new Biquad();
+    this.hpIn.set(3, sr, 80, 0, 0.707);
+    this.deessBand = new Biquad();
+    this.deessBand.set(4, sr, 6800, 0, 1.2); // Static bandpass for sibilance split
     this.eqL = new Biquad();
     this.eqM = new Biquad();
     this.eqH = new Biquad();
@@ -208,6 +217,7 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
     this.gateGain = 1;
     this.compEnv = 0;
     this.deessEnv = 0;
+    this.deessGain = 1;
 
     const dSize = Math.round(0.06 * sr) + 64;
     this.dblBufL = new Float32Array(dSize);
@@ -228,8 +238,8 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
     this.delayBufL = new Float32Array(this.delayMax);
     this.delayBufR = new Float32Array(this.delayMax);
     this.delayWp = 0;
+    this.smoothDelaySmp = Math.round(260 * 0.001 * sr);
 
-    // Telemetry
     this.detNote = 0;
     this.corNote = 0;
     this.voiced = false;
@@ -263,6 +273,7 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
         this.apsR.forEach((a) => a.clear());
         this.sm = 0;
         this.ss = 0;
+        this.wetMix = 0;
         this.pk = 0;
         this.detNote = 0;
         this.corNote = 0;
@@ -289,8 +300,8 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
       this.cfmt = this.formant;
       const fShift = Math.pow(2, this.cfmt / 12);
       const fTarget = Math.max(320, Math.min(2800, 950 * fShift));
-      this.fmt1.set(1, this.sr, fTarget, this.cfmt * 0.55, 1.1);
-      this.fmt2.set(2, this.sr, 2600, this.cfmt * 0.45, 0.707);
+      this.fmt1.set(1, this.sr, fTarget, this.cfmt * 0.5, 1.1);
+      this.fmt2.set(2, this.sr, 2600, this.cfmt * 0.4, 0.707);
     }
   }
 
@@ -311,11 +322,20 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
 
   pitchShift() {
     this.ss += (this.sm - this.ss) * 0.004;
-    const mix = Math.min(1, Math.abs(this.ss) * 3);
-    const dry = this.hist[(this.wp - 2 - this.H) & RING_MASK];
-    if (mix < 0.001 && Math.abs(this.transpose) < 0.01) return dry;
+    const absShift = Math.abs(this.ss);
+    // Clean threshold avoids 50/50 dry+wet comb-filter phasing when pitch isn't being shifted
+    const targetWet =
+      this.tuneAmt < 0.01 && Math.abs(this.transpose) < 0.05
+        ? 0
+        : absShift < 0.03
+        ? 0
+        : Math.min(1, (absShift - 0.03) * 10);
 
-    const r = Math.pow(2, this.ss / 12);
+    this.wetMix += (targetWet - this.wetMix) * 0.005;
+    const dry = this.hist[(this.wp - 2 - this.H) & RING_MASK];
+    if (this.wetMix < 0.001) return dry;
+
+    const r = Math.pow(2, Math.max(-24, Math.min(24, this.ss)) / 12);
     this.ph += (1 - r) / this.N;
     this.ph -= Math.floor(this.ph);
     let f2 = this.ph + 0.5;
@@ -324,7 +344,7 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
     let w1 = Math.sin(3.14159265359 * this.ph);
     w1 *= w1;
     const wet = this.rd(this.ph * this.N) * w1 + this.rd(f2 * this.N) * (1 - w1);
-    return dry * (1 - mix) + wet * mix;
+    return dry * (1 - this.wetMix) + wet * this.wetMix;
   }
 
   analyze() {
@@ -446,17 +466,23 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
     const makeupLin = Math.pow(10, this.compMakeupDb / 20);
 
     const dSize = this.dblBufL.length;
-    const delSmp = Math.max(64, Math.min(this.delayMax - 2, Math.round(this.delayMs * 0.001 * this.sr)));
-    const fb = Math.max(0, Math.min(0.85, this.delayFb));
-    const revFb = 0.72 + this.reverbSize * 0.2;
+    const targetDelSmp = Math.max(64, Math.min(this.delayMax - 2, Math.round(this.delayMs * 0.001 * this.sr)));
+    const fb = Math.max(0, Math.min(0.82, this.delayFb));
+    const revFb = 0.7 + this.reverbSize * 0.2;
 
     for (let i = 0; i < n; i++) {
-      const rawIn = inCh ? inCh[i] : 0;
-      const absRaw = Math.abs(rawIn);
+      let rawIn = inCh ? inCh[i] : 0;
+      if (!Number.isFinite(rawIn)) rawIn = 0;
+
+      // Clean 80 Hz HPF on mic input removes sub-rumble & thumps before recording and DSP
+      const cleanIn = this.hpIn.run(rawIn);
+      const absRaw = Math.abs(cleanIn);
       if (absRaw > this.inPk) this.inPk = absRaw;
 
       if (this.recording) {
-        this.recBatch[this.recBatchIdx++] = rawIn;
+        // Gentle protective soft-saturation keeps recorded raw voice safe from digital overs
+        const recSmp = Math.abs(cleanIn) > 0.85 ? Math.tanh(cleanIn) * 0.96 : cleanIn;
+        this.recBatch[this.recBatchIdx++] = recSmp;
         if (this.recBatchIdx >= this.recBatch.length) {
           const copy = this.recBatch.slice();
           this.port.postMessage({ type: 'rec-chunk', samples: copy }, [copy.buffer]);
@@ -465,17 +491,17 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
       }
 
       if (this.bypass) {
-        outL[i] = rawIn;
-        if (outR !== outL) outR[i] = rawIn;
+        outL[i] = cleanIn;
+        if (outR !== outL) outR[i] = cleanIn;
         this.grDb = 0;
         continue;
       }
 
-      // 1. HPF & Noise Gate
-      let x = this.hpIn.run(rawIn);
+      // 1. Noise Gate
+      let x = cleanIn;
       const ax = Math.abs(x);
       this.gateEnv += (ax - this.gateEnv) * (ax > this.gateEnv ? gAtk : gRel);
-      const tg = this.gateEnv >= gateThr ? 1 : 0.02;
+      const tg = this.gateEnv >= gateThr ? 1 : 0.01;
       this.gateGain += (tg - this.gateGain) * (tg > this.gateGain ? gAtk : gRel);
       x *= this.gateGain;
 
@@ -493,18 +519,19 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
         y = this.fmt2.run(this.fmt1.run(y));
       }
 
-      // 4. De-Esser
+      // 4. Smooth zero-zipper De-Esser (static 6.8 kHz band split + smoothed scalar ducking)
       if (this.deesser > 0.01) {
-        const sib = Math.abs(this.deessDet.run(y));
-        this.deessEnv += (sib - this.deessEnv) * (sib > this.deessEnv ? 0.02 : 0.001);
-        const thr = 0.05 * (1.1 - this.deesser * 0.85);
-        let cutDb = 0;
+        const sibBand = this.deessBand.run(y);
+        const sibAbs = Math.abs(sibBand);
+        this.deessEnv += (sibAbs - this.deessEnv) * (sibAbs > this.deessEnv ? 0.03 : 0.0015);
+        const thr = 0.045 * (1.1 - this.deesser * 0.85);
+        let targetDuck = 1.0;
         if (this.deessEnv > thr) {
-          const overDb = 20 * Math.log10((this.deessEnv + 1e-7) / (thr + 1e-7));
-          cutDb = -Math.max(0, Math.min(14, overDb * 1.4 * this.deesser));
+          const ratio = thr / (this.deessEnv + 1e-7);
+          targetDuck = Math.max(0.25, 1.0 - (1.0 - ratio) * this.deesser * 0.9);
         }
-        this.deessCut.set(2, this.sr, 6200, cutDb, 0.707);
-        y = this.deessCut.run(y);
+        this.deessGain += (targetDuck - this.deessGain) * 0.02;
+        y -= sibBand * (1.0 - this.deessGain);
       }
 
       // 5. 3-Band EQ
@@ -518,6 +545,9 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
       this.grDb = gr;
       y *= Math.pow(10, gr / 20) * makeupLin;
 
+      // Protective soft saturation after EQ+Comp so Doubler/Reverb never get overloaded
+      y = Math.tanh(y * 0.85) * 1.08;
+
       // 7. Doubler / Chorus
       let yL = y;
       let yR = y;
@@ -527,8 +557,8 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
         this.dblPhase += 0.65 / this.sr;
         if (this.dblPhase >= 1) this.dblPhase -= 1;
         const lfo = Math.sin(6.28318530718 * this.dblPhase);
-        const d1 = (0.014 + 0.004 * lfo) * this.sr;
-        const d2 = (0.021 - 0.004 * lfo) * this.sr;
+        const d1 = (0.014 + 0.0035 * lfo) * this.sr;
+        const d2 = (0.021 - 0.0035 * lfo) * this.sr;
         const readDbl = (buf, d) => {
           const id = d | 0;
           const fr = d - id;
@@ -538,9 +568,9 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
         };
         const wL = readDbl(this.dblBufL, d1);
         const wR = readDbl(this.dblBufR, d2);
-        const m = this.doubler * 0.6;
-        yL = yL * (1 - m * 0.35) + wL * m;
-        yR = yR * (1 - m * 0.35) + wR * m;
+        const m = this.doubler * 0.5;
+        yL = yL * (1 - m * 0.3) + wL * m;
+        yR = yR * (1 - m * 0.3) + wR * m;
       }
       if (++this.dblWp >= dSize) this.dblWp = 0;
 
@@ -551,8 +581,8 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
         let sL = 0;
         let sR = 0;
         for (let k = 0; k < 4; k++) {
-          sL += this.combsL[k].run(yL, revFb, 0.32);
-          sR += this.combsR[k].run(yR, revFb, 0.32);
+          sL += this.combsL[k].run(yL, revFb, 0.35);
+          sR += this.combsR[k].run(yR, revFb, 0.35);
         }
         sL *= 0.25;
         sR *= 0.25;
@@ -560,11 +590,13 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
           sL = this.apsL[k].run(sL);
           sR = this.apsR[k].run(sR);
         }
-        fxL += sL * this.reverbMix * 0.55;
-        fxR += sR * this.reverbMix * 0.55;
+        fxL += sL * this.reverbMix * 0.45;
+        fxR += sR * this.reverbMix * 0.45;
       }
 
-      // 9. Stereo Delay
+      // 9. Smoothed Stereo Delay
+      this.smoothDelaySmp += (targetDelSmp - this.smoothDelaySmp) * 0.002;
+      const delSmp = this.smoothDelaySmp | 0;
       const rIdx = (this.delayWp - delSmp + this.delayMax) % this.delayMax;
       const eL = this.delayBufL[rIdx];
       const eR = this.delayBufR[rIdx];
@@ -573,12 +605,13 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
       if (++this.delayWp >= this.delayMax) this.delayWp = 0;
 
       if (this.delayMix > 0.01) {
-        fxL += eL * this.delayMix * 0.6;
-        fxR += eR * this.delayMix * 0.6;
+        fxL += eL * this.delayMix * 0.5;
+        fxR += eR * this.delayMix * 0.5;
       }
 
-      outL[i] = yL + fxL;
-      if (outR !== outL) outR[i] = yR + fxR;
+      // Soft-clipped vocal bus output (clean headroom, never digital harsh clipping)
+      outL[i] = Math.tanh((yL + fxL) * 0.88);
+      if (outR !== outL) outR[i] = Math.tanh((yR + fxR) * 0.88);
     }
 
     this.telemCountdown += n;

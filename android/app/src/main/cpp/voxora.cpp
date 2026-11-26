@@ -51,10 +51,13 @@ struct Biquad {
   void reset() { z1 = z2 = 0.f; }
 
   inline float run(float x) {
+    if (!std::isfinite(x)) return 0.f;
     float y = b0 * x + z1;
     z1 = b1 * x - a1 * y + z2;
     z2 = b2 * x - a2 * y;
-    return y;
+    if (fabsf(z1) < 1e-18f) z1 = 0.f;
+    if (fabsf(z2) < 1e-18f) z2 = 0.f;
+    return std::isfinite(y) ? y : 0.f;
   }
 
   // type: 0 = lowShelf, 1 = peaking, 2 = highShelf, 3 = highPass, 4 = bandPass
@@ -129,7 +132,9 @@ struct CombFilter {
   inline float run(float x, float fb, float damp) {
     float y = buf[idx];
     lp = y * (1.f - damp) + lp * damp;
-    buf[idx] = x + lp * fb;
+    if (fabsf(lp) < 1e-18f) lp = 0.f;
+    float nxt = x + lp * fb;
+    buf[idx] = fabsf(nxt) < 1e-18f ? 0.f : nxt;
     if (++idx >= (int)buf.size()) idx = 0;
     return y;
   }
@@ -207,7 +212,7 @@ class VocalDsp {
  public:
   void init(int sr) {
     sr_ = sr > 0 ? sr : kTargetSr;
-    N_ = std::max(256, (int)(0.04f * sr_));
+    N_ = std::max(256, (int)(0.024f * sr_));
     H_ = N_ >> 1;
     D_ = std::max(2, (int)lroundf((float)sr_ / 12000.f));
     tMax_ = std::min(480, sr_ / D_ / 75);
@@ -235,8 +240,8 @@ class VocalDsp {
     }
 
     resetState();
-    hpIn_.set(3, (float)sr_, 75.f, 0.f, 0.707f);
-    deessDet_.set(4, (float)sr_, 6800.f, 0.f, 1.4f);
+    hpIn_.set(3, (float)sr_, 80.f, 0.f, 0.707f);
+    deessBand_.set(4, (float)sr_, 6800.f, 0.f, 1.4f);
   }
 
   void resetState() {
@@ -246,12 +251,12 @@ class VocalDsp {
     std::fill(doublerBufR_.begin(), doublerBufR_.end(), 0.f);
     for (int k = 0; k < 4; ++k) { combL_[k].clear(); combR_[k].clear(); }
     for (int k = 0; k < 2; ++k) { apL_[k].clear(); apR_[k].clear(); }
-    wp_ = 0; sh_ = 0; ph_ = 0.f; sm_ = 0.f; ss_ = 0.f; pk_ = 0.f; mi_ = 0;
+    wp_ = 0; sh_ = 0; ph_ = 0.f; sm_ = 0.f; ss_ = 0.f; pk_ = 0.f; mi_ = 0; wetMix_ = 0.f;
     memset(mh_, 0, sizeof(mh_));
     gateEnv_ = 0.f; gateGain_ = 1.f;
-    compEnv_ = 0.f; deessEnv_ = 0.f;
-    dblPhase_ = 0.f; dblWp_ = 0; delayWp_ = 0;
-    hpIn_.reset(); deessDet_.reset(); deessCut_.reset();
+    compEnv_ = 0.f; deessEnv_ = 0.f; deessGain_ = 1.f;
+    dblPhase_ = 0.f; dblWp_ = 0; delayWp_ = 0; smoothDelaySmp_ = 0.26f * sr_;
+    hpIn_.reset(); deessBand_.reset();
     eqL_.reset(); eqM_.reset(); eqH_.reset();
     fmt1_.reset(); fmt2_.reset();
     cb_ = cm_ = cmf_ = ch_ = cfmt_ = 1e9f;
@@ -259,15 +264,17 @@ class VocalDsp {
   }
 
   void processSample(float inMono, const VocalParams& p, float& outL, float& outR) {
+    if (!std::isfinite(inMono)) inMono = 0.f;
     if (p.bypass) {
-      outL = outR = inMono;
+      float safe = tanhf(inMono * 0.92f);
+      outL = outR = safe;
       lastGrDb = 0.f;
       return;
     }
 
     updateFilters(p);
 
-    // 1. Filtre coupe-bas 75 Hz anti-plop
+    // 1. Filtre coupe-bas 80 Hz anti-plop
     float x = hpIn_.run(inMono);
 
     // 2. Noise Gate
@@ -294,17 +301,20 @@ class VocalDsp {
       y = fmt2_.run(fmt1_.run(y));
     }
 
-    // 5. De-Esser dynamique (6.8 kHz)
+    // 5. De-Esser dynamique sans recalcul par échantillon (split bande fixe 6.8 kHz)
     if (p.deesserAmt > 0.01f) {
-      float sib = fabsf(deessDet_.run(y));
-      deessEnv_ += (sib - deessEnv_) * (sib > deessEnv_ ? 0.02f : 0.001f);
-      float thr = 0.05f * (1.1f - p.deesserAmt * 0.85f);
-      float cutDb = 0.f;
+      float sibBand = deessBand_.run(y);
+      float sib = fabsf(sibBand);
+      deessEnv_ += (sib - deessEnv_) * (sib > deessEnv_ ? 0.03f : 0.0015f);
+      float thr = 0.045f * (1.1f - p.deesserAmt * 0.85f);
+      float targetG = 1.f;
       if (deessEnv_ > thr) {
-        cutDb = -clampf((linToDb(deessEnv_) - linToDb(thr)) * 1.4f * p.deesserAmt, 0.f, 14.f);
+        float overDb = linToDb(deessEnv_) - linToDb(thr);
+        float cutDb = clampf(overDb * 1.3f * p.deesserAmt, 0.f, 14.f);
+        targetG = dbToLin(-cutDb);
       }
-      deessCut_.set(2, (float)sr_, 6200.f, cutDb, 0.707f);
-      y = deessCut_.run(y);
+      deessGain_ += (targetG - deessGain_) * 0.04f;
+      y -= (1.f - deessGain_) * sibBand;
     }
 
     // 6. EQ 3 bandes RBJ
@@ -365,12 +375,16 @@ class VocalDsp {
       fxR += sR * p.reverbMix * 0.55f;
     }
 
-    // 10. Delay / Écho stéréo
+    // 10. Delay / Écho stéréo avec lissage du temps de delay
     int delMax = (int)delayBuf_.size() / 2;
-    int delSmp = std::clamp((int)(p.delayMs * 0.001f * sr_), 64, delMax - 2);
-    int rIdx = (delayWp_ - delSmp + delMax) % delMax;
-    float eL = delayBuf_[rIdx * 2];
-    float eR = delayBuf_[rIdx * 2 + 1];
+    float targetDelSmp = clampf(p.delayMs * 0.001f * sr_, 64.f, (float)(delMax - 3));
+    smoothDelaySmp_ += (targetDelSmp - smoothDelaySmp_) * 0.002f;
+    int delI = (int)smoothDelaySmp_;
+    float delFr = smoothDelaySmp_ - (float)delI;
+    int rIdx1 = (delayWp_ - delI + delMax) % delMax;
+    int rIdx2 = (delayWp_ - delI - 1 + delMax) % delMax;
+    float eL = delayBuf_[rIdx1 * 2] * (1.f - delFr) + delayBuf_[rIdx2 * 2] * delFr;
+    float eR = delayBuf_[rIdx1 * 2 + 1] * (1.f - delFr) + delayBuf_[rIdx2 * 2 + 1] * delFr;
     delayBuf_[delayWp_ * 2] = yL + eR * clampf(p.delayFb, 0.f, 0.85f);
     delayBuf_[delayWp_ * 2 + 1] = yR + eL * clampf(p.delayFb, 0.f, 0.85f);
     if (++delayWp_ >= delMax) delayWp_ = 0;
@@ -380,8 +394,9 @@ class VocalDsp {
       fxR += eR * p.delayMix * 0.6f;
     }
 
-    outL = yL + fxL;
-    outR = yR + fxR;
+    // Soft-saturation de protection en sortie vocale
+    outL = tanhf((yL + fxL) * 0.88f);
+    outR = tanhf((yR + fxR) * 0.88f);
   }
 
   float lastGrDb = 0.f;
@@ -428,9 +443,10 @@ class VocalDsp {
 
   float pitchShift(const VocalParams& p) {
     ss_ += (sm_ - ss_) * 0.004f;
-    float mix = fminf(1.f, fabsf(ss_) * 3.f);
+    bool active = fabsf(ss_) >= 0.03f || fabsf(p.transpose) >= 0.03f;
+    wetMix_ += ((active ? 1.f : 0.f) - wetMix_) * 0.005f;
     float dry = hist_[(wp_ - 2 - (unsigned)H_) & kMask];
-    if (mix < 0.001f && fabsf(p.transpose) < 0.01f) return dry;
+    if (wetMix_ < 0.002f && !active) return dry;
     float r = exp2f(ss_ / 12.f);
     ph_ += (1.f - r) / (float)N_;
     ph_ -= floorf(ph_);
@@ -439,7 +455,7 @@ class VocalDsp {
     float w1 = sinf(3.14159265f * ph_);
     w1 *= w1;
     float wet = rd(ph_ * N_) * w1 + rd(f2 * N_) * (1.f - w1);
-    return dry * (1.f - mix) + wet * mix;
+    return dry * (1.f - wetMix_) + wet * wetMix_;
   }
 
   void analyze(const VocalParams& p) {
@@ -520,17 +536,17 @@ class VocalDsp {
     corMidi = voiced ? m + sm_ : 0.f;
   }
 
-  int sr_ = kTargetSr, N_ = 1920, H_ = 960, D_ = 4, W_ = 512, tMax_ = 160, tMin_ = 15, L_ = 673;
+  int sr_ = kTargetSr, N_ = 1152, H_ = 576, D_ = 4, W_ = 512, tMax_ = 160, tMin_ = 15, L_ = 673;
   unsigned wp_ = 0;
   int sh_ = 0, mi_ = 0;
-  float ph_ = 0.f, sm_ = 0.f, ss_ = 0.f, pk_ = 0.f;
+  float ph_ = 0.f, sm_ = 0.f, ss_ = 0.f, pk_ = 0.f, wetMix_ = 0.f;
   std::vector<float> hist_, ds_, yin_, delayBuf_, doublerBufL_, doublerBufR_;
   float mh_[5] = {0};
   float gateEnv_ = 0.f, gateGain_ = 1.f;
-  float compEnv_ = 0.f, deessEnv_ = 0.f;
-  float dblPhase_ = 0.f;
+  float compEnv_ = 0.f, deessEnv_ = 0.f, deessGain_ = 1.f;
+  float dblPhase_ = 0.f, smoothDelaySmp_ = 12480.f;
   int dblWp_ = 0, delayWp_ = 0;
-  Biquad hpIn_, deessDet_, deessCut_, eqL_, eqM_, eqH_, fmt1_, fmt2_;
+  Biquad hpIn_, deessBand_, eqL_, eqM_, eqH_, fmt1_, fmt2_;
   CombFilter combL_[4], combR_[4];
   AllpassFilter apL_[2], apR_[2];
   float cb_ = 1e9f, cm_ = 1e9f, cmf_ = 1e9f, ch_ = 1e9f, cfmt_ = 1e9f;
@@ -541,6 +557,9 @@ class MasterDsp {
  public:
   void init(int sr) {
     sr_ = sr > 0 ? sr : kTargetSr;
+    lookLen_ = std::max(32, (int)(0.0025f * sr_));
+    lookBufL_.assign(lookLen_, 0.f);
+    lookBufR_.assign(lookLen_, 0.f);
     resetState();
     atkGlue_ = 1.f - expf(-1.f / (0.015f * sr_));
     relGlue_ = 1.f - expf(-1.f / (0.200f * sr_));
@@ -554,6 +573,9 @@ class MasterDsp {
     excHpL_.reset(); excHpR_.reset();
     excHpL_.set(3, (float)sr_, 3500.f, 0.f, 0.707f);
     excHpR_.set(3, (float)sr_, 3500.f, 0.f, 0.707f);
+    std::fill(lookBufL_.begin(), lookBufL_.end(), 0.f);
+    std::fill(lookBufR_.begin(), lookBufR_.end(), 0.f);
+    lookIdx_ = 0;
     glueEnv_ = 0.f;
     limGain_ = 1.f;
     cl_ = ch_ = 1e9f;
@@ -562,9 +584,11 @@ class MasterDsp {
   }
 
   void processSample(float inL, float inR, const MasterParams& p, float& outL, float& outR) {
+    if (!std::isfinite(inL)) inL = 0.f;
+    if (!std::isfinite(inR)) inR = 0.f;
     if (p.bypass) {
-      outL = clampf(inL, -0.99f, 0.99f);
-      outR = clampf(inR, -0.99f, 0.99f);
+      outL = tanhf(inL * 0.90f);
+      outR = tanhf(inR * 0.90f);
       lastPeakLin = fmaxf(fabsf(outL), fabsf(outR));
       lastRmsSq += ((outL * outL + outR * outR) * 0.5f - lastRmsSq) * 0.001f;
       return;
@@ -598,8 +622,8 @@ class MasterDsp {
     if (p.exciterAmt > 0.01f) {
       float hL = excHpL_.run(L);
       float hR = excHpR_.run(R);
-      L += tanhf(hL * (1.f + p.exciterAmt * 4.f)) * p.exciterAmt * 0.25f;
-      R += tanhf(hR * (1.f + p.exciterAmt * 4.f)) * p.exciterAmt * 0.25f;
+      L += tanhf(hL * (1.f + p.exciterAmt * 4.f)) * p.exciterAmt * 0.22f;
+      R += tanhf(hR * (1.f + p.exciterAmt * 4.f)) * p.exciterAmt * 0.22f;
     }
 
     // Stereo Imager (Mid/Side)
@@ -608,16 +632,24 @@ class MasterDsp {
     L = mid + side;
     R = mid - side;
 
-    // Limiteur Brickwall
+    // Soft-knee analog saturation + Lookahead Brickwall Limiter (2.5 ms)
     float drive = dbToLin(p.limiterDriveDb);
-    L *= drive;
-    R *= drive;
+    L = tanhf(L * drive * 0.72f) / 0.72f;
+    R = tanhf(R * drive * 0.72f) / 0.72f;
+
     float ceilLin = dbToLin(clampf(p.limiterCeilingDb, -6.f, -0.05f));
     float samplePk = fmaxf(fabsf(L), fabsf(R));
     float targetG = samplePk > ceilLin ? ceilLin / samplePk : 1.f;
     limGain_ += (targetG - limGain_) * (targetG < limGain_ ? atkLim_ : relLim_);
-    L = clampf(L * limGain_, -ceilLin, ceilLin);
-    R = clampf(R * limGain_, -ceilLin, ceilLin);
+
+    float delL = lookBufL_[lookIdx_];
+    float delR = lookBufR_[lookIdx_];
+    lookBufL_[lookIdx_] = L;
+    lookBufR_[lookIdx_] = R;
+    if (++lookIdx_ >= lookLen_) lookIdx_ = 0;
+
+    L = clampf(delL * limGain_, -ceilLin, ceilLin);
+    R = clampf(delR * limGain_, -ceilLin, ceilLin);
 
     outL = L;
     outR = R;
@@ -629,7 +661,8 @@ class MasterDsp {
   float lastRmsSq = 0.f;
 
  private:
-  int sr_ = kTargetSr;
+  int sr_ = kTargetSr, lookLen_ = 120, lookIdx_ = 0;
+  std::vector<float> lookBufL_, lookBufR_;
   Biquad eqLowL_, eqLowR_, eqHighL_, eqHighR_, excHpL_, excHpR_;
   float cl_ = 1e9f, ch_ = 1e9f;
   float atkGlue_ = 0.001f, relGlue_ = 0.0001f, glueEnv_ = 0.f;
@@ -994,7 +1027,7 @@ class VoxoraStudioEngine : public AudioStreamDataCallback {
         ->setChannelCount(1)
         ->setSampleRate(kTargetSr)
         ->setSampleRateConversionQuality(SampleRateConversionQuality::Medium)
-        ->setInputPreset(InputPreset::VoicePerformance);
+        ->setInputPreset(InputPreset::VoiceCommunication);
     bool hasIn = (ib.openStream(in_) == Result::OK);
 
     AudioStreamBuilder ob;
@@ -1015,6 +1048,8 @@ class VoxoraStudioEngine : public AudioStreamDataCallback {
     sr_ = out_->getSampleRate();
     liveVocalDsp_.init(sr_);
     masterDsp_.init(sr_);
+    recHp_.reset();
+    recHp_.set(3, (float)sr_, 80.f, 0.f, 0.707f);
     out_->setBufferSizeInFrames(out_->getFramesPerBurst() * 2);
 
     running_.store(true);
@@ -1342,10 +1377,10 @@ class VoxoraStudioEngine : public AudioStreamDataCallback {
         }
       }
 
-      // Bus Master
+      // Bus Master avec headroom -2.2 dB pour éviter la saturation multi-piste
       for (int i = 0; i < n; ++i) {
         float mL, mR;
-        offMaster.processSample(mixL[i], mixR[i], mp, mL, mR);
+        offMaster.processSample(mixL[i] * 0.78f, mixR[i] * 0.78f, mp, mL, mR);
         mixL[i] = mL;
         mixR[i] = mR;
       }
@@ -1454,6 +1489,7 @@ class VoxoraStudioEngine : public AudioStreamDataCallback {
 
     for (int i = 0; i < n; ++i) {
       float mic = i < got ? inScratch_[i] : 0.f;
+      if (!std::isfinite(mic)) mic = 0.f;
       inPk = fmaxf(inPk, fabsf(mic));
 
       float vL = 0.f, vR = 0.f;
@@ -1464,9 +1500,10 @@ class VoxoraStudioEngine : public AudioStreamDataCallback {
         uint32_t rr = recRead_.load(std::memory_order_acquire);
         if (rw - rr < kRecRingFrames - 1) {
           uint32_t idx = (rw & (kRecRingFrames - 1)) * 2;
-          // On enregistre la voix brute (mono->stéréo) ou pré-traitée ? Ici on enregistre brute propre afin que l'utilisateur puisse changer ses effets au mixage !
-          recRing_[idx] = mic;
-          recRing_[idx + 1] = mic;
+          // Filtre coupe-bas 80 Hz + saturation douce de sécurité avant écriture brute
+          float cleanRec = clampf(tanhf(recHp_.run(mic) * 0.95f), -0.98f, 0.98f);
+          recRing_[idx] = cleanRec;
+          recRing_[idx + 1] = cleanRec;
           recWrite_.store(rw + 1, std::memory_order_release);
         }
       }
@@ -1475,6 +1512,7 @@ class VoxoraStudioEngine : public AudioStreamDataCallback {
       float mixR = mon ? vR : 0.f;
 
       if (isPlay && trkLock.owns_lock()) {
+        float trkSumL = 0.f, trkSumR = 0.f;
         for (const auto& t : tracks_) {
           if (!t->active.load() || t->mute.load() || (anySolo && !t->solo.load())) continue;
           uint32_t rr = t->rRead.load(std::memory_order_relaxed);
@@ -1491,10 +1529,12 @@ class VoxoraStudioEngine : public AudioStreamDataCallback {
             }
             float vol = t->volume.load();
             float pan = t->pan.load();
-            mixL += sL * vol * clampf(1.f - pan, 0.f, 1.f);
-            mixR += sR * vol * clampf(1.f + pan, 0.f, 1.f);
+            trkSumL += sL * vol * clampf(1.f - pan, 0.f, 1.f);
+            trkSumR += sR * vol * clampf(1.f + pan, 0.f, 1.f);
           }
         }
+        mixL += trkSumL * 0.78f;
+        mixR += trkSumR * 0.78f;
         playheadFrame_.fetch_add(1, std::memory_order_relaxed);
       }
 
@@ -1612,6 +1652,7 @@ class VoxoraStudioEngine : public AudioStreamDataCallback {
 
   VocalDsp liveVocalDsp_;
   MasterDsp masterDsp_;
+  Biquad recHp_;
   VocalParams vocalParams_;
   MasterParams masterParams_;
   std::mutex paramsMtx_;
@@ -1619,7 +1660,7 @@ class VoxoraStudioEngine : public AudioStreamDataCallback {
   std::vector<std::unique_ptr<TrackSlot>> tracks_;
   std::mutex tracksMtx_;
 
-  std::atomic<bool> running_{false}, playing_{false}, monitorLive_{true}, recActive_{false};
+  std::atomic<bool> running_{false}, playing_{false}, monitorLive_{false}, recActive_{false};
   std::atomic<int64_t> playheadFrame_{0}, maxDurationFrames_{0};
   std::atomic<float> renderProgress_{0.f};
 
