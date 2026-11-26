@@ -174,8 +174,10 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
     this.recording = false;
     this.recBatch = new Float32Array(2048);
     this.recBatchIdx = 0;
+    this.disposed = false;
+    this.postTelemetry = true;
 
-    // Pitch / YIN buffers
+    // Pitch / YIN buffers (pre-allocated, zero GC in process())
     this.hist = new Float32Array(RING_SIZE);
     this.wp = 0;
     this.sh = 0;
@@ -183,9 +185,11 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
     this.sm = 0;
     this.ss = 0;
     this.wetMix = 0;
+    this.pitchActive = false;
     this.pk = 0;
     this.mi = 0;
     this.mh = new Float32Array(5);
+    this.sortBuf = new Float32Array(5);
 
     this.D = Math.max(2, Math.round(sr / 12000));
     this.W = 512;
@@ -197,7 +201,7 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
 
     // Static filter topology (no per-sample coefficient recalculation!)
     this.hpIn = new Biquad();
-    this.hpIn.set(3, sr, 80, 0, 0.707);
+    this.hpIn.set(3, sr, 105, 0, 0.707); // 105 Hz HPF cleans vocal mud & sub clash
     this.deessBand = new Biquad();
     this.deessBand.set(4, sr, 6800, 0, 1.2); // Static bandpass for sibilance split
     this.eqL = new Biquad();
@@ -252,6 +256,12 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
       if (!m) return;
       if (m.type === 'params') {
         Object.assign(this, m.data);
+      } else if (m.type === 'config') {
+        if (m.data && typeof m.data.postTelemetry === 'boolean') {
+          this.postTelemetry = m.data.postTelemetry;
+        }
+      } else if (m.type === 'dispose') {
+        this.disposed = true;
       } else if (m.type === 'rec') {
         const nextRec = Boolean(m.on);
         if (this.recording && !nextRec && this.recBatchIdx > 0) {
@@ -274,6 +284,7 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
         this.sm = 0;
         this.ss = 0;
         this.wetMix = 0;
+        this.pitchActive = false;
         this.pk = 0;
         this.detNote = 0;
         this.corNote = 0;
@@ -321,19 +332,24 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
   }
 
   pitchShift() {
-    this.ss += (this.sm - this.ss) * 0.004;
+    this.ss += (this.sm - this.ss) * 0.005;
     const absShift = Math.abs(this.ss);
-    // Clean threshold avoids 50/50 dry+wet comb-filter phasing when pitch isn't being shifted
-    const targetWet =
-      this.tuneAmt < 0.01 && Math.abs(this.transpose) < 0.05
-        ? 0
-        : absShift < 0.03
-        ? 0
-        : Math.min(1, (absShift - 0.03) * 10);
+    const hasTranspose = Math.abs(this.transpose) >= 0.05;
+    const fxEnabled = this.tuneAmt >= 0.01 || hasTranspose;
 
-    this.wetMix += (targetWet - this.wetMix) * 0.005;
+    // Clean hysteresis prevents 50/50 dry+wet comb-filter phasing around pitch target
+    if (!fxEnabled) {
+      this.pitchActive = false;
+    } else if (hasTranspose || (this.voiced && absShift >= 0.08)) {
+      this.pitchActive = true;
+    } else if ((!this.voiced && absShift < 0.06) || absShift < 0.03) {
+      this.pitchActive = false;
+    }
+
+    const targetWet = this.pitchActive ? 1 : 0;
+    this.wetMix += (targetWet - this.wetMix) * 0.02;
     const dry = this.hist[(this.wp - 2 - this.H) & RING_MASK];
-    if (this.wetMix < 0.001) return dry;
+    if (this.wetMix < 0.002) return dry;
 
     const r = Math.pow(2, Math.max(-24, Math.min(24, this.ss)) / 12);
     this.ph += (1 - r) / this.N;
@@ -406,19 +422,28 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
     }
 
     this.mh[this.mi++ % 5] = voiced ? m : 0;
-    const v = [];
+    let cnt = 0;
     for (let i = 0; i < 5; i++) {
-      if (this.mh[i] > 0) v.push(this.mh[i]);
+      if (this.mh[i] > 0) this.sortBuf[cnt++] = this.mh[i];
     }
-    if (!voiced || v.length < 2) {
+    if (!voiced || cnt < 2) {
       voiced = false;
     } else {
-      v.sort((a, b) => a - b);
-      m = v[v.length >> 1];
+      // Zero-allocation insertion sort
+      for (let i = 1; i < cnt; i++) {
+        const keyVal = this.sortBuf[i];
+        let j = i - 1;
+        while (j >= 0 && this.sortBuf[j] > keyVal) {
+          this.sortBuf[j + 1] = this.sortBuf[j];
+          j--;
+        }
+        this.sortBuf[j + 1] = keyVal;
+      }
+      m = this.sortBuf[cnt >> 1];
     }
 
     let want = this.transpose;
-    let al = 0.15;
+    let al = 0.25;
     if (voiced) {
       const b0 = Math.round(m);
       let best = m;
@@ -446,13 +471,15 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
   }
 
   process(inputs, outputs) {
+    if (this.disposed) return false;
     const input = inputs[0];
     const output = outputs[0];
     if (!output || output.length === 0) return true;
 
     const outL = output[0];
     const outR = output.length > 1 ? output[1] : outL;
-    const inCh = input && input.length > 0 ? input[0] : null;
+    const inL = input && input.length > 0 ? input[0] : null;
+    const inR = input && input.length > 1 ? input[1] : null;
     const n = outL.length;
 
     this.updateFilters();
@@ -468,13 +495,43 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
     const dSize = this.dblBufL.length;
     const targetDelSmp = Math.max(64, Math.min(this.delayMax - 2, Math.round(this.delayMs * 0.001 * this.sr)));
     const fb = Math.max(0, Math.min(0.82, this.delayFb));
-    const revFb = 0.7 + this.reverbSize * 0.2;
+    const revFb = Math.min(0.85, 0.68 + this.reverbSize * 0.17);
+
+    // Phase-safe & single-channel-safe stereo-to-mono summing (prevents phase cancellation or -6 dB drop)
+    let stereoMode = 0; // 0: mono/L-only, 1: (L+R)*0.5, 2: R-only, 3: (L-R)*0.5 (phase inverted)
+    if (inL && inR) {
+      let dot = 0;
+      let eL = 0;
+      let eR = 0;
+      for (let i = 0; i < n; i++) {
+        const l = inL[i];
+        const r = inR[i];
+        dot += l * r;
+        eL += l * l;
+        eR += r * r;
+      }
+      if (eR < eL * 0.02) {
+        stereoMode = 0;
+      } else if (eL < eR * 0.02) {
+        stereoMode = 2;
+      } else if (dot < -0.15 * Math.sqrt(eL * eR + 1e-12)) {
+        stereoMode = 3;
+      } else {
+        stereoMode = 1;
+      }
+    }
 
     for (let i = 0; i < n; i++) {
-      let rawIn = inCh ? inCh[i] : 0;
+      let rawIn = 0;
+      if (inL) {
+        if (stereoMode === 1) rawIn = (inL[i] + inR[i]) * 0.5;
+        else if (stereoMode === 2) rawIn = inR[i];
+        else if (stereoMode === 3) rawIn = (inL[i] - inR[i]) * 0.5;
+        else rawIn = inL[i];
+      }
       if (!Number.isFinite(rawIn)) rawIn = 0;
 
-      // Clean 80 Hz HPF on mic input removes sub-rumble & thumps before recording and DSP
+      // Clean 105 Hz HPF on vocal input removes sub-rumble & mud before recording and DSP
       const cleanIn = this.hpIn.run(rawIn);
       const absRaw = Math.abs(cleanIn);
       if (absRaw > this.inPk) this.inPk = absRaw;
@@ -491,8 +548,9 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
       }
 
       if (this.bypass) {
-        outL[i] = cleanIn;
-        if (outR !== outL) outR[i] = cleanIn;
+        const safeOut = Math.tanh(cleanIn * 0.95);
+        outL[i] = safeOut;
+        if (outR !== outL) outR[i] = safeOut;
         this.grDb = 0;
         continue;
       }
@@ -546,7 +604,7 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
       y *= Math.pow(10, gr / 20) * makeupLin;
 
       // Protective soft saturation after EQ+Comp so Doubler/Reverb never get overloaded
-      y = Math.tanh(y * 0.85) * 1.08;
+      y = Math.tanh(y * 0.82) * 0.96;
 
       // 7. Doubler / Chorus
       let yL = y;
@@ -568,21 +626,21 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
         };
         const wL = readDbl(this.dblBufL, d1);
         const wR = readDbl(this.dblBufR, d2);
-        const m = this.doubler * 0.5;
-        yL = yL * (1 - m * 0.3) + wL * m;
-        yR = yR * (1 - m * 0.3) + wR * m;
+        const m = this.doubler * 0.38;
+        yL = yL * (1 - m * 0.25) + wL * m;
+        yR = yR * (1 - m * 0.25) - wR * m * 0.75;
       }
       if (++this.dblWp >= dSize) this.dblWp = 0;
 
-      // 8. Stereo Reverb
+      // 8. Stereo Reverb (soft-saturated return prevents resonant overload)
       let fxL = 0;
       let fxR = 0;
       if (this.reverbMix > 0.01) {
         let sL = 0;
         let sR = 0;
         for (let k = 0; k < 4; k++) {
-          sL += this.combsL[k].run(yL, revFb, 0.35);
-          sR += this.combsR[k].run(yR, revFb, 0.35);
+          sL += this.combsL[k].run(yL, revFb, 0.38);
+          sR += this.combsR[k].run(yR, revFb, 0.38);
         }
         sL *= 0.25;
         sR *= 0.25;
@@ -590,43 +648,45 @@ class VoxoraStudioProcessor extends AudioWorkletProcessor {
           sL = this.apsL[k].run(sL);
           sR = this.apsR[k].run(sR);
         }
-        fxL += sL * this.reverbMix * 0.45;
-        fxR += sR * this.reverbMix * 0.45;
+        fxL += Math.tanh(sL * 0.85) * this.reverbMix * 0.42;
+        fxR += Math.tanh(sR * 0.85) * this.reverbMix * 0.42;
       }
 
-      // 9. Smoothed Stereo Delay
+      // 9. Smoothed Stereo Delay with feedback soft-saturation
       this.smoothDelaySmp += (targetDelSmp - this.smoothDelaySmp) * 0.002;
       const delSmp = this.smoothDelaySmp | 0;
       const rIdx = (this.delayWp - delSmp + this.delayMax) % this.delayMax;
       const eL = this.delayBufL[rIdx];
       const eR = this.delayBufR[rIdx];
-      this.delayBufL[this.delayWp] = yL + eR * fb;
-      this.delayBufR[this.delayWp] = yR + eL * fb;
+      this.delayBufL[this.delayWp] = Math.tanh((yL + eR * fb) * 0.9);
+      this.delayBufR[this.delayWp] = Math.tanh((yR + eL * fb) * 0.9);
       if (++this.delayWp >= this.delayMax) this.delayWp = 0;
 
       if (this.delayMix > 0.01) {
-        fxL += eL * this.delayMix * 0.5;
-        fxR += eR * this.delayMix * 0.5;
+        fxL += eL * this.delayMix * 0.48;
+        fxR += eR * this.delayMix * 0.48;
       }
 
       // Soft-clipped vocal bus output (clean headroom, never digital harsh clipping)
-      outL[i] = Math.tanh((yL + fxL) * 0.88);
-      if (outR !== outL) outR[i] = Math.tanh((yR + fxR) * 0.88);
+      outL[i] = Math.tanh((yL + fxL) * 0.85);
+      if (outR !== outL) outR[i] = Math.tanh((yR + fxR) * 0.85);
     }
 
-    this.telemCountdown += n;
-    if (this.telemCountdown >= 1280) {
-      this.port.postMessage({
-        type: 'telemetry',
-        det: this.detNote,
-        cor: this.corNote,
-        voiced: this.voiced,
-        inPk: this.inPk,
-        grDb: this.grDb,
-        sr: this.sr,
-      });
-      this.inPk = 0;
-      this.telemCountdown = 0;
+    if (this.postTelemetry) {
+      this.telemCountdown += n;
+      if (this.telemCountdown >= 1280) {
+        this.port.postMessage({
+          type: 'telemetry',
+          det: this.detNote,
+          cor: this.corNote,
+          voiced: this.voiced,
+          inPk: this.inPk,
+          grDb: this.grDb,
+          sr: this.sr,
+        });
+        this.inPk = 0;
+        this.telemCountdown = 0;
+      }
     }
 
     return true;

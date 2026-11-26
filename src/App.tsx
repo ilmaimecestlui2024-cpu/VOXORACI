@@ -20,12 +20,14 @@ import {
   Waves,
 } from 'lucide-react';
 import {
+  BEAT_DEFAULT_VOL,
   BUILTIN_PRESETS,
   DEFAULT_MASTER_SETTINGS,
   DEFAULT_VOCAL_SETTINGS,
   KEYS,
   MasterSettings,
   SCALES,
+  VOCAL_DEFAULT_VOL,
   VocalPreset,
   VocalSettings,
   formatTimecode,
@@ -90,6 +92,8 @@ export default function App() {
   const [devices, setDevices] = useState<AudioInputDevice[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState('');
   const [monitor, setMonitor] = useState(false);
+  const [mixBalance, setMixBalance] = useState(true);
+  const [monoCheck, setMonoCheck] = useState(false);
 
   const [vocal, setVocal] = useState<VocalSettings>(DEFAULT_VOCAL_SETTINGS);
   const [master, setMaster] = useState<MasterSettings>(DEFAULT_MASTER_SETTINGS);
@@ -115,6 +119,9 @@ export default function App() {
   const beatInputRef = useRef<HTMLInputElement | null>(null);
   const vocalInputRef = useRef<HTMLInputElement | null>(null);
   const recCounterRef = useRef(1);
+  const recBusyRef = useRef(false);
+  const exportsRef = useRef<ExportedMix[]>([]);
+  exportsRef.current = exportsList;
 
   // Sync dark/light class on <html>
   useEffect(() => {
@@ -132,6 +139,7 @@ export default function App() {
     engine.setTelemetryCallback((t) => setTelemetry(t));
     return () => {
       engine.stopEngine();
+      exportsRef.current.forEach((exp) => URL.revokeObjectURL(exp.url));
     };
   }, [engine]);
 
@@ -249,6 +257,19 @@ export default function App() {
     });
   };
 
+  const handleAutoMixBalance = () => {
+    setMixBalance(true);
+    engine.setMixOptions({ mixBalance: true });
+    setTracks((prev) => {
+      const next = prev.map((t) => ({
+        ...t,
+        volume: t.isVocal ? VOCAL_DEFAULT_VOL : BEAT_DEFAULT_VOL,
+      }));
+      engine.syncTracks(next);
+      return next;
+    });
+  };
+
   const handleTrackDelete = (id: string) => {
     setTracks((prev) => {
       const next = prev.filter((t) => t.id !== id);
@@ -296,28 +317,37 @@ export default function App() {
   };
 
   const toggleRecord = async () => {
-    if (!(await ensureLiveEngine())) return;
-    if (!isRecording) {
-      if (tracks.length > 0 && !isPlaying) {
-        engine.startPlayback(tracks);
-        setIsPlaying(true);
+    if (recBusyRef.current) return;
+    recBusyRef.current = true;
+    try {
+      if (!(await ensureLiveEngine())) return;
+      if (!isRecording) {
+        if (tracks.length > 0 && !isPlaying) {
+          engine.startPlayback(tracks);
+          setIsPlaying(true);
+        }
+        engine.startRecording();
+        setIsRecording(true);
+      } else {
+        const newTrack = await engine.stopRecordingAndBuildTrack(recCounterRef.current++);
+        setIsRecording(false);
+        if (isPlaying) {
+          engine.pausePlayback();
+          setIsPlaying(false);
+        }
+        if (newTrack) {
+          const takeStartSec = Math.max(0, newTrack.offsetMs / 1000);
+          setTracks((prev) => {
+            const next = [...prev, newTrack];
+            engine.syncTracks(next);
+            engine.seekTo(takeStartSec, next);
+            return next;
+          });
+          setPlayheadSec(takeStartSec);
+        }
       }
-      engine.startRecording();
-      setIsRecording(true);
-    } else {
-      const newTrack = await engine.stopRecordingAndBuildTrack(recCounterRef.current++);
-      setIsRecording(false);
-      if (isPlaying) {
-        engine.pausePlayback();
-        setIsPlaying(false);
-      }
-      if (newTrack) {
-        setTracks((prev) => {
-          const next = [...prev, newTrack];
-          engine.syncTracks(next);
-          return next;
-        });
-      }
+    } finally {
+      recBusyRef.current = false;
     }
   };
 
@@ -663,11 +693,59 @@ export default function App() {
                 </button>
               </div>
 
-              {isImporting && (
-                <span className="text-xs font-mono text-[#0284C7] dark:text-[#5CD0E6]">
-                  Décodage audio en cours...
-                </span>
-              )}
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = !mixBalance;
+                    setMixBalance(next);
+                    engine.setMixOptions({ mixBalance: next });
+                  }}
+                  title="Creuse les médiums de l'instru (320 Hz / 2.4 kHz), filtre le bas de la voix (100 Hz) et applique un ducking dynamique."
+                  className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold border transition-colors whitespace-nowrap cursor-pointer ${
+                    mixBalance
+                      ? 'bg-[#D97706]/12 dark:bg-[#FFB347]/15 border-[#D97706]/40 dark:border-[#FFB347]/40 text-[#D97706] dark:text-[#FFB347]'
+                      : 'bg-white dark:bg-[#121829] border-slate-200 dark:border-white/10 text-slate-500 dark:text-slate-400'
+                  }`}
+                >
+                  <Sliders className="w-3.5 h-3.5" />
+                  {mixBalance ? 'Mix Pro : Actif' : 'Mix Pro : Brut'}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = !monoCheck;
+                    setMonoCheck(next);
+                    engine.setMixOptions({ monoCheck: next });
+                  }}
+                  title="Vérifier la compatibilité Mono / Stéréo et l'absence d'annulation de phase."
+                  className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-mono font-semibold border transition-colors whitespace-nowrap cursor-pointer ${
+                    monoCheck
+                      ? 'bg-[#0284C7]/15 dark:bg-[#5CD0E6]/15 border-[#0284C7]/45 dark:border-[#5CD0E6]/45 text-[#0284C7] dark:text-[#5CD0E6]'
+                      : 'bg-white dark:bg-[#121829] border-slate-200 dark:border-white/10 text-slate-600 dark:text-slate-300'
+                  }`}
+                >
+                  {monoCheck ? 'Écoute : MONO' : 'Écoute : STÉRÉO'}
+                </button>
+
+                {tracks.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={handleAutoMixBalance}
+                    title="Recalibre l'instrumental à 68 % (-3.3 dB) et la voix à 110 % (+0.8 dB)."
+                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-white dark:bg-[#121829] border border-slate-200 dark:border-white/12 text-slate-700 dark:text-slate-200 hover:border-[#D97706] dark:hover:border-[#FFB347] transition-colors whitespace-nowrap cursor-pointer"
+                  >
+                    Équilibrer Voix / Instru
+                  </button>
+                )}
+
+                {isImporting && (
+                  <span className="text-xs font-mono text-[#0284C7] dark:text-[#5CD0E6]">
+                    Décodage audio en cours...
+                  </span>
+                )}
+              </div>
             </div>
 
             {/* Clean Zero-State or Multi-Track Stack */}
@@ -943,7 +1021,7 @@ export default function App() {
                   max={12}
                   step={0.5}
                   unit=" dB"
-                  defaultValue={2}
+                  defaultValue={-1.5}
                   onChange={(v) => updateVocal({ eqLowDb: v })}
                 />
                 <StudioSlider
@@ -965,7 +1043,7 @@ export default function App() {
                   max={6000}
                   step={50}
                   unit=" Hz"
-                  defaultValue={3200}
+                  defaultValue={3000}
                   accent="cyan"
                   onChange={(v) => updateVocal({ eqMidFreq: v })}
                 />
@@ -977,7 +1055,7 @@ export default function App() {
                   max={12}
                   step={0.5}
                   unit=" dB"
-                  defaultValue={4}
+                  defaultValue={3.5}
                   onChange={(v) => updateVocal({ eqHighDb: v })}
                 />
                 <StudioSlider
@@ -999,7 +1077,7 @@ export default function App() {
                   max={12}
                   step={0.1}
                   unit=":1"
-                  defaultValue={3.5}
+                  defaultValue={3.2}
                   accent="cyan"
                   onChange={(v) => updateVocal({ compRatio: v })}
                 />
@@ -1011,7 +1089,7 @@ export default function App() {
                   max={18}
                   step={0.5}
                   unit=" dB"
-                  defaultValue={3}
+                  defaultValue={3.5}
                   onChange={(v) => updateVocal({ compMakeupDb: v })}
                 />
               </div>
@@ -1028,7 +1106,7 @@ export default function App() {
                   min={0}
                   max={100}
                   unit=" %"
-                  defaultValue={15}
+                  defaultValue={12}
                   accent="cyan"
                   onChange={(v) => updateVocal({ doubler: v })}
                 />
@@ -1039,7 +1117,7 @@ export default function App() {
                   min={10}
                   max={100}
                   unit=" %"
-                  defaultValue={55}
+                  defaultValue={50}
                   accent="cyan"
                   onChange={(v) => updateVocal({ reverbSize: v })}
                 />
@@ -1050,7 +1128,7 @@ export default function App() {
                   min={0}
                   max={100}
                   unit=" %"
-                  defaultValue={22}
+                  defaultValue={20}
                   onChange={(v) => updateVocal({ reverbMix: v })}
                 />
                 <StudioSlider
@@ -1140,7 +1218,7 @@ export default function App() {
                 min={-30}
                 max={0}
                 unit=" dB"
-                defaultValue={-14}
+                defaultValue={-12}
                 accent="cyan"
                 onChange={(v) => updateMaster({ glueThreshDb: v })}
               />
@@ -1151,7 +1229,7 @@ export default function App() {
                 min={0}
                 max={100}
                 unit=" %"
-                defaultValue={35}
+                defaultValue={28}
                 accent="cyan"
                 onChange={(v) => updateMaster({ glueMix: v })}
               />
@@ -1172,7 +1250,7 @@ export default function App() {
                 min={0}
                 max={180}
                 unit=" %"
-                defaultValue={108}
+                defaultValue={105}
                 accent="cyan"
                 onChange={(v) => updateMaster({ stereoWidth: v })}
               />
@@ -1184,7 +1262,7 @@ export default function App() {
                 max={12}
                 step={0.5}
                 unit=" dB"
-                defaultValue={1.5}
+                defaultValue={1.2}
                 onChange={(v) => updateMaster({ limiterDriveDb: v })}
               />
               <StudioSlider

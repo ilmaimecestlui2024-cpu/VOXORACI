@@ -8,6 +8,7 @@ import {
 export interface RenderTrackInput {
   id: string;
   name: string;
+  isVocal: boolean;
   buffer: AudioBuffer;
   volume: number;
   pan: number;
@@ -15,6 +16,11 @@ export interface RenderTrackInput {
   solo: boolean;
   offsetMs: number;
   fxEnabled: boolean;
+}
+
+export interface OfflineMixOptions {
+  mixBalance?: boolean;
+  monoCheck?: boolean;
 }
 
 class OfflineBiquad {
@@ -79,9 +85,12 @@ class OfflineVocalChain {
   private sm = 0;
   private ss = 0;
   private wetMix = 0;
+  private pitchActive = false;
+  private lastVoiced = false;
   private pk = 0;
   private mi = 0;
   private mh = new Float32Array(5);
+  private sortBuf = new Float32Array(5);
   private ds = new Float32Array(1200);
   private yin = new Float32Array(512);
 
@@ -124,7 +133,7 @@ class OfflineVocalChain {
     this.L = this.W + this.tMax + 1;
     this.mask = getScaleMask(p.scale);
 
-    this.hpIn.set(3, sr, 80, 0, 0.707);
+    this.hpIn.set(3, sr, 105, 0, 0.707);
     this.deessBand.set(4, sr, 6800, 0, 1.2);
     this.eqL.set(0, sr, 150, p.eqLowDb, 0.707);
     this.eqM.set(1, sr, p.eqMidFreq, p.eqMidDb, 0.9);
@@ -210,17 +219,25 @@ class OfflineVocalChain {
     }
 
     this.mh[this.mi++ % 5] = voiced ? m : 0;
-    const v: number[] = [];
-    for (let i = 0; i < 5; i++) if (this.mh[i] > 0) v.push(this.mh[i]);
-    if (!voiced || v.length < 2) {
+    let cnt = 0;
+    for (let i = 0; i < 5; i++) if (this.mh[i] > 0) this.sortBuf[cnt++] = this.mh[i];
+    if (!voiced || cnt < 2) {
       voiced = false;
     } else {
-      v.sort((a, b) => a - b);
-      m = v[v.length >> 1];
+      for (let i = 1; i < cnt; i++) {
+        const kv = this.sortBuf[i];
+        let j = i - 1;
+        while (j >= 0 && this.sortBuf[j] > kv) {
+          this.sortBuf[j + 1] = this.sortBuf[j];
+          j--;
+        }
+        this.sortBuf[j + 1] = kv;
+      }
+      m = this.sortBuf[cnt >> 1];
     }
 
     let want = this.p.transpose;
-    let al = 0.15;
+    let al = 0.25;
     if (voiced) {
       const b0 = Math.round(m);
       let best = m, bd = 1e9;
@@ -238,12 +255,16 @@ class OfflineVocalChain {
     }
     al = 1 - Math.sqrt(1 - Math.max(0.01, Math.min(0.999, al)));
     this.sm += (want - this.sm) * al;
+    this.lastVoiced = voiced;
   }
 
   processSample(rawIn: number): [number, number] {
     if (!Number.isFinite(rawIn)) rawIn = 0;
     const cleanIn = this.hpIn.run(rawIn);
-    if (this.p.bypass) return [cleanIn, cleanIn];
+    if (this.p.bypass) {
+      const safe = Math.tanh(cleanIn * 0.95);
+      return [safe, safe];
+    }
 
     const gAtk = 1 - Math.exp(-1 / (Math.max(0.5, this.p.gateAttackMs) * 0.001 * this.sr));
     const gRel = 1 - Math.exp(-1 / (Math.max(5, this.p.gateReleaseMs) * 0.001 * this.sr));
@@ -261,19 +282,22 @@ class OfflineVocalChain {
       this.analyze();
     }
 
-    this.ss += (this.sm - this.ss) * 0.004;
+    this.ss += (this.sm - this.ss) * 0.005;
     const absShift = Math.abs(this.ss);
-    const targetWet =
-      this.p.tuneAmt < 1 && Math.abs(this.p.transpose) < 0.05
-        ? 0
-        : absShift < 0.03
-        ? 0
-        : Math.min(1, (absShift - 0.03) * 10);
-    this.wetMix += (targetWet - this.wetMix) * 0.005;
+    const hasTranspose = Math.abs(this.p.transpose) >= 0.05;
+    const fxOn = this.p.tuneAmt >= 1 || hasTranspose;
+    if (!fxOn) {
+      this.pitchActive = false;
+    } else if (hasTranspose || (this.lastVoiced && absShift >= 0.08)) {
+      this.pitchActive = true;
+    } else if ((!this.lastVoiced && absShift < 0.06) || absShift < 0.03) {
+      this.pitchActive = false;
+    }
+    this.wetMix += ((this.pitchActive ? 1 : 0) - this.wetMix) * 0.02;
 
     const dry = this.hist[(this.wp - 2 - this.H) & 65535];
     let y = dry;
-    if (this.wetMix >= 0.001) {
+    if (this.wetMix >= 0.002) {
       const r = Math.pow(2, Math.max(-24, Math.min(24, this.ss)) / 12);
       this.ph += (1 - r) / this.N;
       this.ph -= Math.floor(this.ph);
@@ -311,7 +335,7 @@ class OfflineVocalChain {
     const over = 20 * Math.log10(this.compEnv + 1e-7) - this.p.compThreshDb;
     const gr = over > 0 ? -over * (1 - 1 / Math.max(1, this.p.compRatio)) : 0;
     y *= Math.pow(10, (gr + this.p.compMakeupDb) / 20);
-    y = Math.tanh(y * 0.85) * 1.08;
+    y = Math.tanh(y * 0.82) * 0.96;
 
     let yL = y, yR = y;
     const dSize = this.dblL.length;
@@ -329,28 +353,28 @@ class OfflineVocalChain {
       };
       const wL = rdDbl(this.dblL, (0.014 + 0.0035 * lfo) * this.sr);
       const wR = rdDbl(this.dblR, (0.021 - 0.0035 * lfo) * this.sr);
-      const m = dblMix * 0.5;
-      yL = yL * (1 - m * 0.3) + wL * m;
-      yR = yR * (1 - m * 0.3) + wR * m;
+      const m = dblMix * 0.38;
+      yL = yL * (1 - m * 0.25) + wL * m;
+      yR = yR * (1 - m * 0.25) - wR * m * 0.75;
     }
     if (++this.dblWp >= dSize) this.dblWp = 0;
 
     let fxL = 0, fxR = 0;
     const revMix = this.p.reverbMix / 100;
     if (revMix > 0.01) {
-      const revFb = 0.7 + (this.p.reverbSize / 100) * 0.2;
+      const revFb = Math.min(0.85, 0.68 + (this.p.reverbSize / 100) * 0.17);
       let sL = 0, sR = 0;
       for (let k = 0; k < 4; k++) {
         const cL = this.combsL[k];
         const outC = cL.buf[cL.idx];
-        cL.lp = outC * 0.65 + cL.lp * 0.35;
+        cL.lp = outC * 0.62 + cL.lp * 0.38;
         cL.buf[cL.idx] = yL + cL.lp * revFb;
         if (++cL.idx >= cL.buf.length) cL.idx = 0;
         sL += outC;
 
         const cR = this.combsR[k];
         const outCR = cR.buf[cR.idx];
-        cR.lp = outCR * 0.65 + cR.lp * 0.35;
+        cR.lp = outCR * 0.62 + cR.lp * 0.38;
         cR.buf[cR.idx] = yR + cR.lp * revFb;
         if (++cR.idx >= cR.buf.length) cR.idx = 0;
         sR += outCR;
@@ -369,8 +393,8 @@ class OfflineVocalChain {
         if (++aR.idx >= aR.buf.length) aR.idx = 0;
         sR = -sR + oAR;
       }
-      fxL += sL * revMix * 0.45;
-      fxR += sR * revMix * 0.45;
+      fxL += Math.tanh(sL * 0.85) * revMix * 0.42;
+      fxR += Math.tanh(sR * 0.85) * revMix * 0.42;
     }
 
     const delMax = this.delL.length;
@@ -379,16 +403,16 @@ class OfflineVocalChain {
     const eL = this.delL[rIdx];
     const eR = this.delR[rIdx];
     const fb = Math.max(0, Math.min(0.82, this.p.delayFb / 100));
-    this.delL[this.delWp] = yL + eR * fb;
-    this.delR[this.delWp] = yR + eL * fb;
+    this.delL[this.delWp] = Math.tanh((yL + eR * fb) * 0.9);
+    this.delR[this.delWp] = Math.tanh((yR + eL * fb) * 0.9);
     if (++this.delWp >= delMax) this.delWp = 0;
     const delMix = this.p.delayMix / 100;
     if (delMix > 0.01) {
-      fxL += eL * delMix * 0.5;
-      fxR += eR * delMix * 0.5;
+      fxL += eL * delMix * 0.48;
+      fxR += eR * delMix * 0.48;
     }
 
-    return [Math.tanh((yL + fxL) * 0.88), Math.tanh((yR + fxR) * 0.88)];
+    return [Math.tanh((yL + fxL) * 0.85), Math.tanh((yR + fxR) * 0.85)];
   }
 }
 
@@ -409,7 +433,7 @@ class OfflineMasterChain {
   private lookBufR: Float32Array;
   private lookIdx = 0;
 
-  constructor(sr: number, private m: MasterSettings) {
+  constructor(sr: number, private m: MasterSettings, private monoCheck = false) {
     this.eqLowL.set(0, sr, 65, m.eqLowDb, 0.707);
     this.eqLowR.set(0, sr, 65, m.eqLowDb, 0.707);
     this.eqHighL.set(2, sr, 12000, m.eqHighDb, 0.707);
@@ -430,6 +454,11 @@ class OfflineMasterChain {
     if (!Number.isFinite(L)) L = 0;
     if (!Number.isFinite(R)) R = 0;
     if (this.m.bypass) {
+      if (this.monoCheck) {
+        const mid = (L + R) * 0.5;
+        L = mid;
+        R = mid;
+      }
       return [Math.tanh(L * 0.9), Math.tanh(R * 0.9)];
     }
     L = this.eqHighL.run(this.eqLowL.run(L));
@@ -455,8 +484,13 @@ class OfflineMasterChain {
     const mid = (L + R) * 0.5;
     const side = (L - R) * 0.5 * (this.m.stereoWidth / 100);
     const drive = Math.pow(10, this.m.limiterDriveDb / 20);
-    L = Math.tanh(((mid + side) * drive) * 0.72) / 0.72;
-    R = Math.tanh(((mid - side) * drive) * 0.72) / 0.72;
+    if (this.monoCheck) {
+      L = Math.tanh(mid * drive * 0.72) / 0.72;
+      R = L;
+    } else {
+      L = Math.tanh(((mid + side) * drive) * 0.72) / 0.72;
+      R = Math.tanh(((mid - side) * drive) * 0.72) / 0.72;
+    }
 
     const delL = this.lookBufL[this.lookIdx];
     const delR = this.lookBufR[this.lookIdx];
@@ -475,29 +509,51 @@ class OfflineMasterChain {
   }
 }
 
+function detectStereoSumMode(ch0: Float32Array, ch1: Float32Array): number {
+  if (ch0 === ch1) return 0;
+  let dot = 0, eL = 0, eR = 0;
+  const step = Math.max(1, Math.floor(ch0.length / 8192));
+  for (let i = 0; i < ch0.length; i += step) {
+    const l = ch0[i], r = ch1[i];
+    dot += l * r;
+    eL += l * l;
+    eR += r * r;
+  }
+  if (eR < eL * 0.02) return 0;
+  if (eL < eR * 0.02) return 2;
+  if (dot < -0.15 * Math.sqrt(eL * eR + 1e-12)) return 3;
+  return 1;
+}
+
 export async function renderMultiTrackOffline(
   tracks: RenderTrackInput[],
   vocalSettings: VocalSettings,
   masterSettings: MasterSettings,
   sampleRate: number,
   format: 'wav16' | 'wav24',
-  onProgress: (pct: number) => void
+  onProgress: (pct: number) => void,
+  mixOptions: OfflineMixOptions = {}
 ): Promise<Blob> {
   const anySolo = tracks.some((t) => t.solo);
   const active = tracks.filter((t) => !t.mute && (!anySolo || t.solo));
 
   let maxFrames = 0;
+  let beatCount = 0;
+  let vocalCount = 0;
   const prepared = active.map((t) => {
     const offFrames = Math.round((t.offsetMs / 1000) * sampleRate);
     const end = Math.max(0, t.buffer.length + offFrames);
     if (end > maxFrames) maxFrames = end;
     const ch0 = t.buffer.getChannelData(0);
     const ch1 = t.buffer.numberOfChannels > 1 ? t.buffer.getChannelData(1) : ch0;
+    if (t.isVocal) vocalCount++;
+    else beatCount++;
     return {
       track: t,
       offFrames,
       ch0,
       ch1,
+      stereoMode: detectStereoSumMode(ch0, ch1),
       vocalChain: t.fxEnabled ? new OfflineVocalChain(sampleRate, vocalSettings) : null,
     };
   });
@@ -506,16 +562,44 @@ export async function renderMultiTrackOffline(
     return encodeStereoWav(new Float32Array(sampleRate), new Float32Array(sampleRate), sampleRate, 16);
   }
 
+  const mixBalance = mixOptions.mixBalance ?? true;
+  const monoCheck = mixOptions.monoCheck ?? false;
+  const pocketActive = mixBalance && vocalCount > 0 && !masterSettings.bypass;
+
+  const beatLowMidL = new OfflineBiquad();
+  const beatLowMidR = new OfflineBiquad();
+  const beatPresL = new OfflineBiquad();
+  const beatPresR = new OfflineBiquad();
+  beatLowMidL.set(1, sampleRate, 320, -1.8, 0.8);
+  beatLowMidR.set(1, sampleRate, 320, -1.8, 0.8);
+  beatPresL.set(1, sampleRate, 2400, -2.8, 0.75);
+  beatPresR.set(1, sampleRate, 2400, -2.8, 0.75);
+
+  const vocHpL = new OfflineBiquad();
+  const vocHpR = new OfflineBiquad();
+  vocHpL.set(3, sampleRate, 100, 0, 0.707);
+  vocHpR.set(3, sampleRate, 100, 0, 0.707);
+
+  const scAtk = 1 - Math.exp(-1 / (0.012 * sampleRate));
+  const scRel = 1 - Math.exp(-1 / (0.180 * sampleRate));
+  let scEnv = 0;
+  let duckGain = 1;
+
   const outL = new Float32Array(maxFrames);
   const outR = new Float32Array(maxFrames);
-  const master = new OfflineMasterChain(sampleRate, masterSettings);
+  const master = new OfflineMasterChain(sampleRate, masterSettings, monoCheck);
+  const beatHeadroom = Math.min(0.92, 0.92 / Math.sqrt(Math.max(1, beatCount)));
+  const vocHeadroom = Math.min(0.96, 0.96 / Math.sqrt(Math.max(1, vocalCount)));
 
   const chunkSize = 8192;
   for (let start = 0; start < maxFrames; start += chunkSize) {
     const end = Math.min(maxFrames, start + chunkSize);
     for (let i = start; i < end; i++) {
-      let sumL = 0;
-      let sumR = 0;
+      let beatL = 0;
+      let beatR = 0;
+      let vocL = 0;
+      let vocR = 0;
+
       for (let k = 0; k < prepared.length; k++) {
         const pt = prepared[k];
         const idx = i - pt.offFrames;
@@ -526,16 +610,45 @@ export async function renderMultiTrackOffline(
           sR = pt.ch1[idx];
         }
         if (pt.vocalChain) {
-          const [pL, pR] = pt.vocalChain.processSample((sL + sR) * 0.5);
+          let monoIn = sL;
+          if (pt.stereoMode === 1) monoIn = (sL + sR) * 0.5;
+          else if (pt.stereoMode === 2) monoIn = sR;
+          else if (pt.stereoMode === 3) monoIn = (sL - sR) * 0.5;
+          const [pL, pR] = pt.vocalChain.processSample(monoIn);
           sL = pL;
           sR = pR;
         }
         const gL = pt.track.volume * Math.max(0, Math.min(1, 1 - pt.track.pan));
         const gR = pt.track.volume * Math.max(0, Math.min(1, 1 + pt.track.pan));
-        sumL += sL * gL * 0.78;
-        sumR += sR * gR * 0.78;
+        if (pt.track.isVocal) {
+          vocL += sL * gL * vocHeadroom;
+          vocR += sR * gR * vocHeadroom;
+        } else {
+          beatL += sL * gL * beatHeadroom;
+          beatR += sR * gR * beatHeadroom;
+        }
       }
-      const [mL, mR] = master.processSample(sumL, sumR);
+
+      if (pocketActive) {
+        vocL = vocHpL.run(vocL);
+        vocR = vocHpR.run(vocR);
+        beatL = beatPresL.run(beatLowMidL.run(beatL));
+        beatR = beatPresR.run(beatLowMidR.run(beatR));
+
+        const vPk = Math.max(Math.abs(vocL), Math.abs(vocR));
+        scEnv += (vPk - scEnv) * (vPk > scEnv ? scAtk : scRel);
+        let targetDuck = 1.0;
+        if (scEnv > 0.01585) {
+          const overDb = 20 * Math.log10(scEnv / 0.01585);
+          const cutDb = Math.min(2.8, overDb * 0.22);
+          targetDuck = Math.pow(10, -cutDb / 20);
+        }
+        duckGain += (targetDuck - duckGain) * (targetDuck < duckGain ? scAtk : scRel);
+        beatL *= duckGain;
+        beatR *= duckGain;
+      }
+
+      const [mL, mR] = master.processSample(beatL + vocL, beatR + vocR);
       outL[i] = mL;
       outR[i] = mR;
     }

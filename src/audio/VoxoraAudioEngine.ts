@@ -1,7 +1,9 @@
 import {
+  BEAT_DEFAULT_VOL,
   DEFAULT_MASTER_SETTINGS,
   DEFAULT_VOCAL_SETTINGS,
   MasterSettings,
+  VOCAL_DEFAULT_VOL,
   VocalSettings,
   getScaleMask,
 } from './constants';
@@ -57,6 +59,9 @@ interface ActiveNodeGraph {
   gain: GainNode;
   pan: StereoPannerNode;
   vocalWorklet?: AudioWorkletNode;
+  fxEnabled: boolean;
+  offsetMs: number;
+  isVocal: boolean;
 }
 
 const HISTORY_LEN = 220;
@@ -68,7 +73,8 @@ export class VoxoraAudioEngine {
   private masterWorklet: AudioWorkletNode | null = null;
   private inputGain: GainNode | null = null;
   private monitorGain: GainNode | null = null;
-  private tracksMixBus: GainNode | null = null;
+  private beatMixBus: GainNode | null = null;
+  private vocalMixBus: GainNode | null = null;
 
   // Live vocal source
   private micStream: MediaStream | null = null;
@@ -95,6 +101,8 @@ export class VoxoraAudioEngine {
   private vocalSettings: VocalSettings = { ...DEFAULT_VOCAL_SETTINGS };
   private masterSettings: MasterSettings = { ...DEFAULT_MASTER_SETTINGS };
   private monitorEnabled = false;
+  private mixBalance = true;
+  private monoCheck = false;
 
   // 60fps canvas ring buffers
   public readonly detHistory = new Float32Array(HISTORY_LEN);
@@ -163,9 +171,12 @@ export class VoxoraAudioEngine {
         this.monitorGain = this.ctx.createGain();
         this.monitorGain.gain.value = this.monitorEnabled ? 1 : 0;
 
-        // -2.2 dB mix bus headroom prevents multi-track summing distortion
-        this.tracksMixBus = this.ctx.createGain();
-        this.tracksMixBus.gain.value = 0.78;
+        // Separate Instrumental (input 0) & Vocal (input 1) buses for clean EQ pocket & sidechain
+        this.beatMixBus = this.ctx.createGain();
+        this.beatMixBus.gain.value = 0.92;
+
+        this.vocalMixBus = this.ctx.createGain();
+        this.vocalMixBus.gain.value = 0.96;
 
         this.vocalWorklet = new AudioWorkletNode(this.ctx, 'voxora-processor', {
           numberOfInputs: 1,
@@ -174,15 +185,16 @@ export class VoxoraAudioEngine {
         });
 
         this.masterWorklet = new AudioWorkletNode(this.ctx, 'voxora-master-processor', {
-          numberOfInputs: 1,
+          numberOfInputs: 2,
           numberOfOutputs: 1,
           outputChannelCount: [2],
         });
 
         this.inputGain.connect(this.vocalWorklet);
         this.vocalWorklet.connect(this.monitorGain);
-        this.monitorGain.connect(this.masterWorklet);
-        this.tracksMixBus.connect(this.masterWorklet);
+        this.monitorGain.connect(this.vocalMixBus);
+        this.beatMixBus.connect(this.masterWorklet, 0, 0);
+        this.vocalMixBus.connect(this.masterWorklet, 0, 1);
         this.masterWorklet.connect(this.ctx.destination);
 
         this.vocalWorklet.port.onmessage = (ev) => this.onVocalMsg(ev.data);
@@ -252,16 +264,29 @@ export class VoxoraAudioEngine {
 
     if (mode === 'mic') {
       // Enable hardware/WebRTC AEC & Noise Suppression to stop instrumental bleed & weird echo loops
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          deviceId: deviceId ? { exact: deviceId } : undefined,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          channelCount: 1,
-        },
-        video: false,
-      });
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            deviceId: deviceId ? { ideal: deviceId } : undefined,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            channelCount: 1,
+          },
+          video: false,
+        });
+      } catch {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            channelCount: 1,
+          },
+          video: false,
+        });
+      }
       this.micStream = stream;
       this.micSource = this.ctx.createMediaStreamSource(stream);
       this.micSource.connect(this.inputGain);
@@ -335,16 +360,39 @@ export class VoxoraAudioEngine {
   }
 
   public stopEngine() {
+    this.isRecording = false;
+    this.recChunks = [];
+    this.recTotalSamples = 0;
     this.stopPlayback();
     this.disconnectSource();
     if (this.vocalWorklet) {
-      this.vocalWorklet.disconnect();
+      try {
+        this.vocalWorklet.port.postMessage({ type: 'dispose' });
+        this.vocalWorklet.port.onmessage = null;
+        this.vocalWorklet.disconnect();
+      } catch {
+        // ignore
+      }
       this.vocalWorklet = null;
     }
     if (this.masterWorklet) {
-      this.masterWorklet.disconnect();
+      try {
+        this.masterWorklet.port.postMessage({ type: 'dispose' });
+        this.masterWorklet.port.onmessage = null;
+        this.masterWorklet.disconnect();
+      } catch {
+        // ignore
+      }
       this.masterWorklet = null;
     }
+    this.inputGain?.disconnect();
+    this.inputGain = null;
+    this.monitorGain?.disconnect();
+    this.monitorGain = null;
+    this.beatMixBus?.disconnect();
+    this.beatMixBus = null;
+    this.vocalMixBus?.disconnect();
+    this.vocalMixBus = null;
     this.workletsLoaded = false;
     if (this.ctx) {
       this.ctx.close().catch(() => {});
@@ -359,6 +407,13 @@ export class VoxoraAudioEngine {
     if (this.ctx && this.monitorGain) {
       this.monitorGain.gain.setTargetAtTime(on ? 1 : 0, this.ctx.currentTime, 0.012);
     }
+    this.pushMasterSettings();
+  }
+
+  public setMixOptions(opts: { mixBalance?: boolean; monoCheck?: boolean }) {
+    if (opts.mixBalance !== undefined) this.mixBalance = opts.mixBalance;
+    if (opts.monoCheck !== undefined) this.monoCheck = opts.monoCheck;
+    this.pushMasterSettings();
   }
 
   public updateVocalSettings(v: VocalSettings) {
@@ -410,6 +465,12 @@ export class VoxoraAudioEngine {
     });
   }
 
+  private hasActiveVocal(): boolean {
+    if (this.monitorEnabled) return true;
+    const anySolo = this.tracks.some((t) => t.solo);
+    return this.tracks.some((t) => t.isVocal && !t.mute && (!anySolo || t.solo));
+  }
+
   private pushMasterSettings() {
     const m = this.masterSettings;
     this.masterWorklet?.port.postMessage({
@@ -425,8 +486,44 @@ export class VoxoraAudioEngine {
         limiterCeilingDb: m.limiterCeilingDb,
         limiterDriveDb: m.limiterDriveDb,
         bypass: m.bypass,
+        mixBalance: this.mixBalance,
+        hasVocal: this.hasActiveVocal(),
+        monoCheck: this.monoCheck,
       },
     });
+  }
+
+  // Smart active-RMS vocal leveling ensures quiet mic takes or stems aren't buried by mastered beats
+  private autoLevelVocalBuffer(buffer: AudioBuffer, maxGainLinear = 4.0) {
+    const ch0 = buffer.getChannelData(0);
+    const ch1 = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : null;
+    let sumSq = 0;
+    let activeCount = 0;
+    let peak = 0;
+    for (let i = 0; i < ch0.length; i++) {
+      const s = ch1 ? Math.max(Math.abs(ch0[i]), Math.abs(ch1[i])) : Math.abs(ch0[i]);
+      if (s > peak) peak = s;
+      if (s > 0.008) {
+        sumSq += s * s;
+        activeCount++;
+      }
+    }
+    if (activeCount < 64 || peak < 0.002) return;
+    const activeRms = Math.sqrt(sumSq / activeCount);
+    // Bring quiet vocal recordings/stems up toward -14 dBFS RMS (0.20), capped safely
+    if (activeRms < 0.16 && peak < 0.55) {
+      const desiredGain = Math.min(maxGainLinear, 0.20 / activeRms, 0.85 / peak);
+      if (desiredGain > 1.08) {
+        for (let i = 0; i < ch0.length; i++) {
+          const v0 = ch0[i] * desiredGain;
+          ch0[i] = Math.abs(v0) > 0.85 ? Math.tanh(v0) * 0.94 : v0;
+          if (ch1) {
+            const v1 = ch1[i] * desiredGain;
+            ch1[i] = Math.abs(v1) > 0.85 ? Math.tanh(v1) * 0.94 : v1;
+          }
+        }
+      }
+    }
   }
 
   // ---------- Unlimited Multi-Track Import & Management ----------
@@ -439,6 +536,12 @@ export class VoxoraAudioEngine {
     }
     const arr = await file.arrayBuffer();
     const buffer = await this.ctx.decodeAudioData(arr);
+    if (buffer.length === 0 || buffer.duration <= 0) {
+      throw new Error('Fichier audio vide');
+    }
+    if (isVocal) {
+      this.autoLevelVocalBuffer(buffer, 4.0);
+    }
     const peaks = this.computePeaks(buffer, 240);
 
     return {
@@ -449,7 +552,7 @@ export class VoxoraAudioEngine {
       buffer,
       durationSec: buffer.duration,
       peaks,
-      volume: 1.0,
+      volume: isVocal ? VOCAL_DEFAULT_VOL : BEAT_DEFAULT_VOL,
       pan: 0,
       mute: false,
       solo: false,
@@ -477,8 +580,44 @@ export class VoxoraAudioEngine {
     return peaks;
   }
 
+  private updateMixBusHeadroom(tracks: StudioTrack[]) {
+    if (!this.ctx || !this.beatMixBus || !this.vocalMixBus) return;
+    const anySolo = tracks.some((t) => t.solo);
+    let beatCount = 0;
+    let vocalCount = 0;
+    for (const t of tracks) {
+      if (!t.mute && (!anySolo || t.solo)) {
+        if (t.isVocal) vocalCount++;
+        else beatCount++;
+      }
+    }
+    const beatHeadroom = Math.min(0.92, 0.92 / Math.sqrt(Math.max(1, beatCount)));
+    const vocalHeadroom = Math.min(0.96, 0.96 / Math.sqrt(Math.max(1, vocalCount)));
+    this.beatMixBus.gain.setTargetAtTime(beatHeadroom, this.ctx.currentTime, 0.015);
+    this.vocalMixBus.gain.setTargetAtTime(vocalHeadroom, this.ctx.currentTime, 0.015);
+  }
+
   public syncTracks(tracks: StudioTrack[]) {
     this.tracks = tracks;
+    this.pushMasterSettings();
+    if (this.isPlaying) {
+      const needsGraphRebuild =
+        tracks.length !== this.activeNodes.size ||
+        tracks.some((t) => {
+          const node = this.activeNodes.get(t.id);
+          return (
+            !node ||
+            node.fxEnabled !== t.fxEnabled ||
+            node.offsetMs !== t.offsetMs ||
+            node.isVocal !== t.isVocal
+          );
+        });
+      if (needsGraphRebuild) {
+        this.startPlayback(tracks, this.getPlayheadSec());
+        return;
+      }
+    }
+    this.updateMixBusHeadroom(tracks);
     const anySolo = tracks.some((t) => t.solo);
     for (const t of tracks) {
       const node = this.activeNodes.get(t.id);
@@ -491,7 +630,7 @@ export class VoxoraAudioEngine {
   }
 
   public startPlayback(tracks: StudioTrack[], fromSec?: number) {
-    if (!this.ctx || !this.tracksMixBus) return;
+    if (!this.ctx || !this.beatMixBus || !this.vocalMixBus) return;
     this.tracks = tracks;
     this.stopActiveTrackNodes();
 
@@ -499,6 +638,8 @@ export class VoxoraAudioEngine {
       this.playheadOffsetSec = Math.max(0, fromSec);
     }
 
+    this.updateMixBusHeadroom(tracks);
+    this.pushMasterSettings();
     const now = this.ctx.currentTime + 0.025;
     this.playStartCtxTime = now - this.playheadOffsetSec;
     const anySolo = tracks.some((t) => t.solo);
@@ -523,6 +664,7 @@ export class VoxoraAudioEngine {
           numberOfOutputs: 1,
           outputChannelCount: [2],
         });
+        vocalNode.port.postMessage({ type: 'config', data: { postTelemetry: false } });
         src.connect(vocalNode);
         vocalNode.connect(gain);
       } else {
@@ -530,7 +672,7 @@ export class VoxoraAudioEngine {
       }
 
       gain.connect(pan);
-      pan.connect(this.tracksMixBus);
+      pan.connect(t.isVocal ? this.vocalMixBus : this.beatMixBus);
 
       const effectiveSec = this.playheadOffsetSec - t.offsetMs / 1000;
       if (effectiveSec < t.durationSec) {
@@ -541,7 +683,15 @@ export class VoxoraAudioEngine {
         }
       }
 
-      this.activeNodes.set(t.id, { source: src, gain, pan, vocalWorklet: vocalNode });
+      this.activeNodes.set(t.id, {
+        source: src,
+        gain,
+        pan,
+        vocalWorklet: vocalNode,
+        fxEnabled: t.fxEnabled,
+        offsetMs: t.offsetMs,
+        isVocal: t.isVocal,
+      });
     }
 
     this.isPlaying = true;
@@ -595,7 +745,10 @@ export class VoxoraAudioEngine {
           window.setTimeout(() => {
             try {
               n.source.disconnect();
-              n.vocalWorklet?.disconnect();
+              if (n.vocalWorklet) {
+                n.vocalWorklet.port.postMessage({ type: 'dispose' });
+                n.vocalWorklet.disconnect();
+              }
               n.gain.disconnect();
               n.pan.disconnect();
             } catch {
@@ -605,6 +758,10 @@ export class VoxoraAudioEngine {
         } else {
           n.source.stop();
           n.source.disconnect();
+          if (n.vocalWorklet) {
+            n.vocalWorklet.port.postMessage({ type: 'dispose' });
+            n.vocalWorklet.disconnect();
+          }
         }
       } catch {
         // ignore
@@ -619,15 +776,20 @@ export class VoxoraAudioEngine {
     this.recTotalSamples = 0;
     this.isRecording = true;
 
-    const baseLat = this.ctx?.baseLatency ?? 0;
-    const outLat =
+    const baseLat = Math.max(0.015, this.ctx?.baseLatency ?? 0);
+    const rawOutLat =
       (this.ctx as (AudioContext & { outputLatency?: number }) | null)?.outputLatency ?? 0;
+    const outLat = rawOutLat > 0 ? rawOutLat : 0.02;
     const lookaheadPendingSec =
       this.ctx && this.isPlaying
         ? Math.max(0, this.playStartCtxTime + this.playheadOffsetSec - this.ctx.currentTime)
         : 0;
-    // Compensate round-trip audio latency + pending buffer lookahead so recorded voice locks cleanly with the instrumental
-    this.recLatencyCompMs = Math.round((baseLat + outLat + lookaheadPendingSec) * 1000);
+
+    // Compensate round-trip hardware latency + pending buffer lookahead when overdubbing over tracks
+    this.recLatencyCompMs =
+      this.isPlaying && this.tracks.length > 0
+        ? Math.round((baseLat + outLat + lookaheadPendingSec) * 1000)
+        : 25;
     this.recStartSec =
       this.ctx && this.isPlaying
         ? Math.max(this.playheadOffsetSec, this.ctx.currentTime - this.playStartCtxTime)
@@ -652,16 +814,18 @@ export class VoxoraAudioEngine {
     this.recChunks = [];
     this.recTotalSamples = 0;
 
-    // Trim leading round-trip hardware latency samples cleanly if recording started over a beat
     const sr = this.ctx.sampleRate;
     const trimSamples = Math.min(
       Math.max(0, merged.length - 256),
       Math.round((this.recLatencyCompMs / 1000) * sr)
     );
     const synced = trimSamples > 0 ? merged.subarray(trimSamples) : merged;
+    if (synced.length < Math.round(0.04 * sr)) {
+      return null;
+    }
 
-    // 10ms smooth fade-in and fade-out on recorded clip edges to guarantee zero clicks
-    const fadeLen = Math.min(synced.length >> 2, Math.round(0.01 * sr));
+    // 12ms smooth fade-in and fade-out on recorded clip edges to guarantee zero clicks
+    const fadeLen = Math.min(synced.length >> 2, Math.round(0.012 * sr));
     for (let i = 0; i < fadeLen; i++) {
       const w = i / fadeLen;
       synced[i] *= w;
@@ -670,6 +834,7 @@ export class VoxoraAudioEngine {
 
     const buffer = this.ctx.createBuffer(1, synced.length, sr);
     buffer.copyToChannel(synced, 0);
+    this.autoLevelVocalBuffer(buffer, 5.0);
 
     return {
       id: `rec-${Date.now()}`,
@@ -679,7 +844,7 @@ export class VoxoraAudioEngine {
       buffer,
       durationSec: buffer.duration,
       peaks: this.computePeaks(buffer, 240),
-      volume: 1.0,
+      volume: VOCAL_DEFAULT_VOL,
       pan: 0,
       mute: false,
       solo: false,
@@ -700,7 +865,8 @@ export class VoxoraAudioEngine {
       this.masterSettings,
       sr,
       format,
-      onProgress
+      onProgress,
+      { mixBalance: this.mixBalance, monoCheck: this.monoCheck }
     );
     const url = URL.createObjectURL(blob);
     const dur = this.getTotalDurationSec(tracks);

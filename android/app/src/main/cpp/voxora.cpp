@@ -240,7 +240,7 @@ class VocalDsp {
     }
 
     resetState();
-    hpIn_.set(3, (float)sr_, 80.f, 0.f, 0.707f);
+    hpIn_.set(3, (float)sr_, 105.f, 0.f, 0.707f);
     deessBand_.set(4, (float)sr_, 6800.f, 0.f, 1.4f);
   }
 
@@ -266,7 +266,7 @@ class VocalDsp {
   void processSample(float inMono, const VocalParams& p, float& outL, float& outR) {
     if (!std::isfinite(inMono)) inMono = 0.f;
     if (p.bypass) {
-      float safe = tanhf(inMono * 0.92f);
+      float safe = tanhf(inMono * 0.95f);
       outL = outR = safe;
       lastGrDb = 0.f;
       return;
@@ -350,20 +350,20 @@ class VocalDsp {
       };
       float wetL = readDbl(doublerBufL_, d1);
       float wetR = readDbl(doublerBufR_, d2);
-      float m = p.doublerMix * 0.6f;
-      yL = yL * (1.f - m * 0.35f) + wetL * m;
-      yR = yR * (1.f - m * 0.35f) + wetR * m;
+      float m = p.doublerMix * 0.38f;
+      yL = yL * (1.f - m * 0.25f) + wetL * m;
+      yR = yR * (1.f - m * 0.25f) - wetR * m * 0.75f;
     }
     if (++dblWp_ >= dSize) dblWp_ = 0;
 
-    // 9. Réverbération stéréo (Schroeder)
+    // 9. Réverbération stéréo (Schroeder) avec soft-saturation anti-surcharge
     float fxL = 0.f, fxR = 0.f;
     if (p.reverbMix > 0.01f) {
-      float fb = 0.72f + p.reverbSize * 0.20f;
+      float fb = fminf(0.85f, 0.68f + clampf(p.reverbSize, 0.f, 1.f) * 0.17f);
       float sL = 0.f, sR = 0.f;
       for (int k = 0; k < 4; ++k) {
-        sL += combL_[k].run(yL, fb, 0.32f);
-        sR += combR_[k].run(yR, fb, 0.32f);
+        sL += combL_[k].run(yL, fb, 0.38f);
+        sR += combR_[k].run(yR, fb, 0.38f);
       }
       sL *= 0.25f;
       sR *= 0.25f;
@@ -371,11 +371,11 @@ class VocalDsp {
         sL = apL_[k].run(sL);
         sR = apR_[k].run(sR);
       }
-      fxL += sL * p.reverbMix * 0.55f;
-      fxR += sR * p.reverbMix * 0.55f;
+      fxL += tanhf(sL * 0.85f) * p.reverbMix * 0.42f;
+      fxR += tanhf(sR * 0.85f) * p.reverbMix * 0.42f;
     }
 
-    // 10. Delay / Écho stéréo avec lissage du temps de delay
+    // 10. Delay / Écho stéréo avec lissage du temps et feedback maîtrisé
     int delMax = (int)delayBuf_.size() / 2;
     float targetDelSmp = clampf(p.delayMs * 0.001f * sr_, 64.f, (float)(delMax - 3));
     smoothDelaySmp_ += (targetDelSmp - smoothDelaySmp_) * 0.002f;
@@ -385,18 +385,19 @@ class VocalDsp {
     int rIdx2 = (delayWp_ - delI - 1 + delMax) % delMax;
     float eL = delayBuf_[rIdx1 * 2] * (1.f - delFr) + delayBuf_[rIdx2 * 2] * delFr;
     float eR = delayBuf_[rIdx1 * 2 + 1] * (1.f - delFr) + delayBuf_[rIdx2 * 2 + 1] * delFr;
-    delayBuf_[delayWp_ * 2] = yL + eR * clampf(p.delayFb, 0.f, 0.85f);
-    delayBuf_[delayWp_ * 2 + 1] = yR + eL * clampf(p.delayFb, 0.f, 0.85f);
+    float dFb = clampf(p.delayFb, 0.f, 0.82f);
+    delayBuf_[delayWp_ * 2] = tanhf((yL + eR * dFb) * 0.90f);
+    delayBuf_[delayWp_ * 2 + 1] = tanhf((yR + eL * dFb) * 0.90f);
     if (++delayWp_ >= delMax) delayWp_ = 0;
 
     if (p.delayMix > 0.01f) {
-      fxL += eL * p.delayMix * 0.6f;
-      fxR += eR * p.delayMix * 0.6f;
+      fxL += eL * p.delayMix * 0.48f;
+      fxR += eR * p.delayMix * 0.48f;
     }
 
     // Soft-saturation de protection en sortie vocale
-    outL = tanhf((yL + fxL) * 0.88f);
-    outR = tanhf((yR + fxR) * 0.88f);
+    outL = tanhf((yL + fxL) * 0.85f);
+    outR = tanhf((yR + fxR) * 0.85f);
   }
 
   float lastGrDb = 0.f;
@@ -442,12 +443,21 @@ class VocalDsp {
   }
 
   float pitchShift(const VocalParams& p) {
-    ss_ += (sm_ - ss_) * 0.004f;
-    bool active = fabsf(ss_) >= 0.03f || fabsf(p.transpose) >= 0.03f;
-    wetMix_ += ((active ? 1.f : 0.f) - wetMix_) * 0.005f;
+    ss_ += (sm_ - ss_) * 0.005f;
+    float absShift = fabsf(ss_);
+    bool hasTranspose = fabsf(p.transpose) >= 0.05f;
+    bool fxOn = p.tuneAmt >= 0.01f || hasTranspose;
+    if (!fxOn) {
+      pitchActive_ = false;
+    } else if (hasTranspose || (lastVoiced_ && absShift >= 0.08f)) {
+      pitchActive_ = true;
+    } else if ((!lastVoiced_ && absShift < 0.06f) || absShift < 0.03f) {
+      pitchActive_ = false;
+    }
+    wetMix_ += ((pitchActive_ ? 1.f : 0.f) - wetMix_) * 0.02f;
     float dry = hist_[(wp_ - 2 - (unsigned)H_) & kMask];
-    if (wetMix_ < 0.002f && !active) return dry;
-    float r = exp2f(ss_ / 12.f);
+    if (wetMix_ < 0.002f && !pitchActive_) return dry;
+    float r = exp2f(clampf(ss_, -24.f, 24.f) / 12.f);
     ph_ += (1.f - r) / (float)N_;
     ph_ -= floorf(ph_);
     float f2 = ph_ + 0.5f;
@@ -532,6 +542,7 @@ class VocalDsp {
     }
     al = 1.f - sqrtf(1.f - clampf(al, 0.01f, 0.999f));
     sm_ += (want - sm_) * al;
+    lastVoiced_ = voiced;
     detMidi = voiced ? m : 0.f;
     corMidi = voiced ? m + sm_ : 0.f;
   }
@@ -540,6 +551,7 @@ class VocalDsp {
   unsigned wp_ = 0;
   int sh_ = 0, mi_ = 0;
   float ph_ = 0.f, sm_ = 0.f, ss_ = 0.f, pk_ = 0.f, wetMix_ = 0.f;
+  bool pitchActive_ = false, lastVoiced_ = false;
   std::vector<float> hist_, ds_, yin_, delayBuf_, doublerBufL_, doublerBufR_;
   float mh_[5] = {0};
   float gateEnv_ = 0.f, gateGain_ = 1.f;
@@ -667,6 +679,54 @@ class MasterDsp {
   float cl_ = 1e9f, ch_ = 1e9f;
   float atkGlue_ = 0.001f, relGlue_ = 0.0001f, glueEnv_ = 0.f;
   float atkLim_ = 0.05f, relLim_ = 0.0005f, limGain_ = 1.f;
+};
+
+// ---------- Séparation Fréquentielle Instru / Voix + Sidechain Ducking ----------
+class MixPocketDsp {
+ public:
+  void init(int sr) {
+    sr_ = sr > 0 ? sr : kTargetSr;
+    beatLowMidL_.set(1, (float)sr_, 320.f, -1.8f, 0.8f);
+    beatLowMidR_.set(1, (float)sr_, 320.f, -1.8f, 0.8f);
+    beatPresL_.set(1, (float)sr_, 2400.f, -2.8f, 0.75f);
+    beatPresR_.set(1, (float)sr_, 2400.f, -2.8f, 0.75f);
+    vocHpL_.set(3, (float)sr_, 100.f, 0.f, 0.707f);
+    vocHpR_.set(3, (float)sr_, 100.f, 0.f, 0.707f);
+    scAtk_ = 1.f - expf(-1.f / (0.012f * sr_));
+    scRel_ = 1.f - expf(-1.f / (0.180f * sr_));
+    scEnv_ = 0.f;
+    duckGain_ = 1.f;
+  }
+
+  inline void process(bool active, float& bL, float& bR, float& vL, float& vR) {
+    if (!active) {
+      duckGain_ += (1.f - duckGain_) * 0.01f;
+      bL *= duckGain_;
+      bR *= duckGain_;
+      return;
+    }
+    vL = vocHpL_.run(vL);
+    vR = vocHpR_.run(vR);
+    bL = beatPresL_.run(beatLowMidL_.run(bL));
+    bR = beatPresR_.run(beatLowMidR_.run(bR));
+
+    float vPk = fmaxf(fabsf(vL), fabsf(vR));
+    scEnv_ += (vPk - scEnv_) * (vPk > scEnv_ ? scAtk_ : scRel_);
+    float targetDuck = 1.f;
+    if (scEnv_ > 0.01585f) {
+      float overDb = linToDb(scEnv_ / 0.01585f);
+      float cutDb = fminf(2.8f, overDb * 0.22f);
+      targetDuck = dbToLin(-cutDb);
+    }
+    duckGain_ += (targetDuck - duckGain_) * (targetDuck < duckGain_ ? scAtk_ : scRel_);
+    bL *= duckGain_;
+    bR *= duckGain_;
+  }
+
+ private:
+  int sr_ = kTargetSr;
+  Biquad beatLowMidL_, beatLowMidR_, beatPresL_, beatPresR_, vocHpL_, vocHpR_;
+  float scAtk_ = 0.002f, scRel_ = 0.0001f, scEnv_ = 0.f, duckGain_ = 1.f;
 };
 
 // ---------- Piste Multi-Piste avec Streaming Disque Sans Limite ----------
@@ -1048,9 +1108,10 @@ class VoxoraStudioEngine : public AudioStreamDataCallback {
     sr_ = out_->getSampleRate();
     liveVocalDsp_.init(sr_);
     masterDsp_.init(sr_);
+    mixPocketDsp_.init(sr_);
     recHp_.reset();
-    recHp_.set(3, (float)sr_, 80.f, 0.f, 0.707f);
-    out_->setBufferSizeInFrames(out_->getFramesPerBurst() * 2);
+    recHp_.set(3, (float)sr_, 105.f, 0.f, 0.707f);
+    out_->setBufferSizeInFrames(std::max(out_->getFramesPerBurst() * 3, 192));
 
     running_.store(true);
     diskThread_ = std::thread(&VoxoraStudioEngine::diskStreamerLoop, this);
@@ -1226,6 +1287,7 @@ class VoxoraStudioEngine : public AudioStreamDataCallback {
       int64_t totalFrames = 0;
       int64_t offsetFrames = 0;
       float vol = 1.f, pan = 0.f;
+      bool isVocal = false;
       bool fx = false;
       VocalDsp vocalDsp;
     };
@@ -1246,6 +1308,7 @@ class VoxoraStudioEngine : public AudioStreamDataCallback {
         ot.offsetFrames = (int64_t)(t->offsetMs.load() * 0.001f * sr_);
         ot.vol = t->volume.load();
         ot.pan = t->pan.load();
+        ot.isVocal = t->isVocal.load();
         ot.fx = t->fxEnabled.load();
         ot.vocalDsp.init(sr_);
         list.push_back(std::move(ot));
@@ -1266,9 +1329,11 @@ class VoxoraStudioEngine : public AudioStreamDataCallback {
 
     MasterDsp offMaster;
     offMaster.init(sr_);
+    MixPocketDsp offPocket;
+    offPocket.init(sr_);
 
     const int kBlock = 1024;
-    std::vector<float> mixL(kBlock), mixR(kBlock), trkBuf(kBlock * 2);
+    std::vector<float> beatL(kBlock), beatR(kBlock), vocL(kBlock), vocR(kBlock), trkBuf(kBlock * 2);
 
     FILE* wavOut = nullptr;
     AMediaCodec* aacEnc = nullptr;
@@ -1339,32 +1404,48 @@ class VoxoraStudioEngine : public AudioStreamDataCallback {
 
     std::vector<uint8_t> outBytes(kBlock * 2 * 3);
     int64_t cursor = 0;
+    int beatCnt = 0, vocCnt = 0;
+    for (const auto& t : list) {
+      if (t.isVocal) vocCnt++;
+      else beatCnt++;
+    }
+    const float beatHeadroom = fminf(0.92f, 0.92f / sqrtf(fmaxf(1.f, (float)beatCnt)));
+    const float vocHeadroom = fminf(0.96f, 0.96f / sqrtf(fmaxf(1.f, (float)vocCnt)));
+    const bool pocketActive = (vocCnt > 0) && !mp.bypass;
+    std::vector<float> mixL(kBlock), mixR(kBlock);
 
     while (cursor < maxFrames) {
       int n = (int)std::min<int64_t>(kBlock, maxFrames - cursor);
-      std::fill(mixL.begin(), mixL.begin() + n, 0.f);
-      std::fill(mixR.begin(), mixR.begin() + n, 0.f);
+      std::fill(beatL.begin(), beatL.begin() + n, 0.f);
+      std::fill(beatR.begin(), beatR.begin() + n, 0.f);
+      std::fill(vocL.begin(), vocL.begin() + n, 0.f);
+      std::fill(vocR.begin(), vocR.begin() + n, 0.f);
 
       for (auto& trk : list) {
         int64_t localStart = cursor - trk.offsetFrames;
         if (localStart + n <= 0 || localStart >= trk.totalFrames) continue;
 
-        float gainL = trk.vol * clampf(1.f - trk.pan, 0.f, 1.f);
-        float gainR = trk.vol * clampf(1.f + trk.pan, 0.f, 1.f);
+        int iBegin = localStart < 0 ? (int)(-localStart) : 0;
+        int64_t fileStart = localStart + iBegin;
+        int availFrames = (int)std::min<int64_t>(n - iBegin, trk.totalFrames - fileStart);
+        if (availFrames > 0) {
+          fseek(trk.fp, (long)(fileStart * 2 * sizeof(float)), SEEK_SET);
+          size_t readCnt = fread(trkBuf.data(), sizeof(float) * 2, (size_t)availFrames, trk.fp);
+          if ((int)readCnt < availFrames) {
+            std::fill(trkBuf.begin() + readCnt * 2, trkBuf.begin() + availFrames * 2, 0.f);
+          }
+        }
+
+        const float hr = trk.isVocal ? vocHeadroom : beatHeadroom;
+        float gainL = trk.vol * clampf(1.f - trk.pan, 0.f, 1.f) * hr;
+        float gainR = trk.vol * clampf(1.f + trk.pan, 0.f, 1.f) * hr;
 
         for (int i = 0; i < n; ++i) {
-          int64_t fIdx = localStart + i;
           float sL = 0.f, sR = 0.f;
-          if (fIdx >= 0 && fIdx < trk.totalFrames) {
-            // Lecture séquentielle propre
-            if (i == 0 || fIdx == 0) {
-              fseek(trk.fp, (long)(fIdx * 2 * sizeof(float)), SEEK_SET);
-            }
-            float pair[2] = {0.f, 0.f};
-            if (fread(pair, sizeof(float), 2, trk.fp) == 2) {
-              sL = pair[0];
-              sR = pair[1];
-            }
+          if (i >= iBegin && i < iBegin + availFrames) {
+            int bi = (i - iBegin) * 2;
+            sL = trkBuf[bi];
+            sR = trkBuf[bi + 1];
           }
           if (trk.fx) {
             float pL, pR;
@@ -1372,15 +1453,21 @@ class VoxoraStudioEngine : public AudioStreamDataCallback {
             sL = pL;
             sR = pR;
           }
-          mixL[i] += sL * gainL;
-          mixR[i] += sR * gainR;
+          if (trk.isVocal) {
+            vocL[i] += sL * gainL;
+            vocR[i] += sR * gainR;
+          } else {
+            beatL[i] += sL * gainL;
+            beatR[i] += sR * gainR;
+          }
         }
       }
 
-      // Bus Master avec headroom -2.2 dB pour éviter la saturation multi-piste
+      // Séparation fréquentielle + Sidechain + Bus Master
       for (int i = 0; i < n; ++i) {
+        offPocket.process(pocketActive, beatL[i], beatR[i], vocL[i], vocR[i]);
         float mL, mR;
-        offMaster.processSample(mixL[i] * 0.78f, mixR[i] * 0.78f, mp, mL, mR);
+        offMaster.processSample(beatL[i] + vocL[i], beatR[i] + vocR[i], mp, mL, mR);
         mixL[i] = mL;
         mixR[i] = mR;
       }
@@ -1483,9 +1570,20 @@ class VoxoraStudioEngine : public AudioStreamDataCallback {
     // Note: l'accès à tracks_ dans onAudioReady utilise try_lock pour ne jamais bloquer le thread RT
     std::unique_lock<std::mutex> trkLock(tracksMtx_, std::try_to_lock);
     bool anySolo = false;
+    int beatCount = 0;
+    int vocCount = 0;
     if (trkLock.owns_lock()) {
       for (const auto& t : tracks_) if (t->solo.load()) { anySolo = true; break; }
+      for (const auto& t : tracks_) {
+        if (t->active.load() && !t->mute.load() && (!anySolo || t->solo.load())) {
+          if (t->isVocal.load()) vocCount++;
+          else beatCount++;
+        }
+      }
     }
+    const float beatHeadroom = fminf(0.92f, 0.92f / sqrtf(fmaxf(1.f, (float)beatCount)));
+    const float vocHeadroom = fminf(0.96f, 0.96f / sqrtf(fmaxf(1.f, (float)vocCount)));
+    const bool pocketActive = (mon || vocCount > 0) && !mp.bypass;
 
     for (int i = 0; i < n; ++i) {
       float mic = i < got ? inScratch_[i] : 0.f;
@@ -1500,7 +1598,7 @@ class VoxoraStudioEngine : public AudioStreamDataCallback {
         uint32_t rr = recRead_.load(std::memory_order_acquire);
         if (rw - rr < kRecRingFrames - 1) {
           uint32_t idx = (rw & (kRecRingFrames - 1)) * 2;
-          // Filtre coupe-bas 80 Hz + saturation douce de sécurité avant écriture brute
+          // Filtre coupe-bas 105 Hz + saturation douce de sécurité avant écriture brute
           float cleanRec = clampf(tanhf(recHp_.run(mic) * 0.95f), -0.98f, 0.98f);
           recRing_[idx] = cleanRec;
           recRing_[idx + 1] = cleanRec;
@@ -1508,11 +1606,13 @@ class VoxoraStudioEngine : public AudioStreamDataCallback {
         }
       }
 
-      float mixL = mon ? vL : 0.f;
-      float mixR = mon ? vR : 0.f;
+      float busBeatL = 0.f, busBeatR = 0.f;
+      float busVocL = mon ? vL : 0.f;
+      float busVocR = mon ? vR : 0.f;
 
       if (isPlay && trkLock.owns_lock()) {
-        float trkSumL = 0.f, trkSumR = 0.f;
+        float trkBeatL = 0.f, trkBeatR = 0.f;
+        float trkVocL = 0.f, trkVocR = 0.f;
         for (const auto& t : tracks_) {
           if (!t->active.load() || t->mute.load() || (anySolo && !t->solo.load())) continue;
           uint32_t rr = t->rRead.load(std::memory_order_relaxed);
@@ -1529,17 +1629,27 @@ class VoxoraStudioEngine : public AudioStreamDataCallback {
             }
             float vol = t->volume.load();
             float pan = t->pan.load();
-            trkSumL += sL * vol * clampf(1.f - pan, 0.f, 1.f);
-            trkSumR += sR * vol * clampf(1.f + pan, 0.f, 1.f);
+            float gL = vol * clampf(1.f - pan, 0.f, 1.f);
+            float gR = vol * clampf(1.f + pan, 0.f, 1.f);
+            if (t->isVocal.load()) {
+              trkVocL += sL * gL;
+              trkVocR += sR * gR;
+            } else {
+              trkBeatL += sL * gL;
+              trkBeatR += sR * gR;
+            }
           }
         }
-        mixL += trkSumL * 0.78f;
-        mixR += trkSumR * 0.78f;
+        busBeatL += trkBeatL * beatHeadroom;
+        busBeatR += trkBeatR * beatHeadroom;
+        busVocL += trkVocL * vocHeadroom;
+        busVocR += trkVocR * vocHeadroom;
         playheadFrame_.fetch_add(1, std::memory_order_relaxed);
       }
 
+      mixPocketDsp_.process(pocketActive, busBeatL, busBeatR, busVocL, busVocR);
       float outL, outR;
-      masterDsp_.processSample(mixL, mixR, mp, outL, outR);
+      masterDsp_.processSample(busBeatL + busVocL, busBeatR + busVocR, mp, outL, outR);
       out[i * 2] = outL;
       out[i * 2 + 1] = outR;
     }
@@ -1652,6 +1762,7 @@ class VoxoraStudioEngine : public AudioStreamDataCallback {
 
   VocalDsp liveVocalDsp_;
   MasterDsp masterDsp_;
+  MixPocketDsp mixPocketDsp_;
   Biquad recHp_;
   VocalParams vocalParams_;
   MasterParams masterParams_;

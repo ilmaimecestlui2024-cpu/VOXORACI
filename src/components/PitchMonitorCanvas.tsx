@@ -27,43 +27,55 @@ export const PitchMonitorCanvas: React.FC<PitchMonitorCanvasProps> = ({
 
   useEffect(() => {
     let rafId = 0;
+    let active = true;
+
+    const drawOnce = () => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const rect = canvas.getBoundingClientRect();
+      const targetW = Math.max(1, Math.floor(rect.width * dpr));
+      const targetH = Math.max(1, Math.floor(rect.height * dpr));
+      if (canvas.width !== targetW || canvas.height !== targetH) {
+        canvas.width = targetW;
+        canvas.height = targetH;
+      }
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.save();
+        ctx.scale(dpr, dpr);
+        drawPitchPlot(
+          ctx,
+          rect.width,
+          rect.height,
+          engine,
+          propsRef.current.keyIndex,
+          propsRef.current.scaleName,
+          propsRef.current.live,
+          propsRef.current.bypass,
+          propsRef.current.isDark
+        );
+        ctx.restore();
+      }
+    };
+
+    if (!live) {
+      drawOnce();
+      return;
+    }
 
     const render = () => {
-      const canvas = canvasRef.current;
-      if (canvas) {
-        const dpr = Math.min(window.devicePixelRatio || 1, 2);
-        const rect = canvas.getBoundingClientRect();
-        const targetW = Math.max(1, Math.floor(rect.width * dpr));
-        const targetH = Math.max(1, Math.floor(rect.height * dpr));
-        if (canvas.width !== targetW || canvas.height !== targetH) {
-          canvas.width = targetW;
-          canvas.height = targetH;
-        }
-
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          ctx.save();
-          ctx.scale(dpr, dpr);
-          drawPitchPlot(
-            ctx,
-            rect.width,
-            rect.height,
-            engine,
-            propsRef.current.keyIndex,
-            propsRef.current.scaleName,
-            propsRef.current.live,
-            propsRef.current.bypass,
-            propsRef.current.isDark
-          );
-          ctx.restore();
-        }
-      }
+      if (!active) return;
+      drawOnce();
       rafId = requestAnimationFrame(render);
     };
 
     rafId = requestAnimationFrame(render);
-    return () => cancelAnimationFrame(rafId);
-  }, [engine]);
+    return () => {
+      active = false;
+      cancelAnimationFrame(rafId);
+    };
+  }, [engine, live, bypass, isDark, keyIndex, scaleName]);
 
   const activeMidi = telemetry.cor > 0 ? telemetry.cor : telemetry.det;
   const noteInfo = midiToNoteInfo(activeMidi);

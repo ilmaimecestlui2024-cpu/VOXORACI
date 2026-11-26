@@ -159,12 +159,23 @@ class _StudioWorkspacePageState extends State<StudioWorkspacePage> {
     }
   }
 
-  Future<bool> _ensureEngineStarted() async {
-    if (_engineRunning) return true;
-    final micOk = await Permission.microphone.request().isGranted;
-    if (!micOk) {
-      _showMsg('Autorise le microphone pour activer le moteur audio.');
-      return false;
+  Future<bool> _ensureEngineStarted({bool requireMic = false}) async {
+    if (_engineRunning) {
+      if (requireMic && !await Permission.microphone.isGranted) {
+        final micOk = await Permission.microphone.request().isGranted;
+        if (!micOk) {
+          _showMsg('Autorise le microphone pour enregistrer ta voix.');
+          return false;
+        }
+      }
+      return true;
+    }
+    if (requireMic) {
+      final micOk = await Permission.microphone.request().isGranted;
+      if (!micOk) {
+        _showMsg('Autorise le microphone pour enregistrer ta voix.');
+        return false;
+      }
     }
     _ffi.applyVocal(_vocal);
     _ffi.applyMaster(_master);
@@ -256,7 +267,7 @@ class _StudioWorkspacePageState extends State<StudioWorkspacePage> {
   }
 
   Future<void> _toggleRecord() async {
-    if (!await _ensureEngineStarted()) return;
+    if (!await _ensureEngineStarted(requireMic: true)) return;
     if (!_isRecording) {
       final dir = await getTemporaryDirectory();
       final cacheDir = Directory('${dir.path}/voxora_tracks');

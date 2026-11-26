@@ -53,6 +53,9 @@ export interface VocalSettings {
   bypass: boolean;
 }
 
+export const BEAT_DEFAULT_VOL = 0.68; // -3.3 dB headroom behind lead vocals
+export const VOCAL_DEFAULT_VOL = 1.10; // +0.8 dB upfront vocal presence
+
 export const DEFAULT_VOCAL_SETTINGS: VocalSettings = {
   key: 0,
   scale: 'Chromatique',
@@ -64,20 +67,20 @@ export const DEFAULT_VOCAL_SETTINGS: VocalSettings = {
   gateAttackMs: 5,
   gateReleaseMs: 120,
   deesser: 25,
-  eqLowDb: 2,
+  eqLowDb: -1.5,
   eqMidDb: 3,
-  eqMidFreq: 3200,
-  eqHighDb: 4,
+  eqMidFreq: 3000,
+  eqHighDb: 3.5,
   compThreshDb: -18,
-  compRatio: 3.5,
-  compAttackMs: 5,
-  compReleaseMs: 140,
-  compMakeupDb: 3,
-  doubler: 15,
-  reverbSize: 55,
-  reverbMix: 22,
+  compRatio: 3.2,
+  compAttackMs: 8,
+  compReleaseMs: 130,
+  compMakeupDb: 3.5,
+  doubler: 12,
+  reverbSize: 50,
+  reverbMix: 20,
   delayMs: 260,
-  delayFb: 35,
+  delayFb: 32,
   delayMix: 0,
   bypass: false,
 };
@@ -98,13 +101,13 @@ export interface MasterSettings {
 export const DEFAULT_MASTER_SETTINGS: MasterSettings = {
   eqLowDb: 0,
   eqHighDb: 1,
-  glueThreshDb: -14,
-  glueRatio: 2.5,
-  glueMix: 35,
+  glueThreshDb: -12,
+  glueRatio: 2.2,
+  glueMix: 28,
   exciter: 15,
-  stereoWidth: 108,
+  stereoWidth: 105,
   limiterCeilingDb: -1.0,
-  limiterDriveDb: 1.5,
+  limiterDriveDb: 1.2,
   bypass: false,
 };
 
@@ -121,9 +124,9 @@ export const BUILTIN_PRESETS: VocalPreset[] = [
     name: 'Naturel',
     isCustom: false,
     values: {
-      tuneAmt: 0, tuneSpeed: 50, formant: 0, gateThreshDb: -54, deesser: 15,
-      eqLowDb: 0, eqMidDb: 1.5, eqMidFreq: 3000, eqHighDb: 2,
-      compThreshDb: -14, compRatio: 2.2, compMakeupDb: 1.5,
+      tuneAmt: 0, tuneSpeed: 50, formant: 0, gateThreshDb: -54, deesser: 18,
+      eqLowDb: -1.5, eqMidDb: 2.0, eqMidFreq: 3000, eqHighDb: 2.5,
+      compThreshDb: -16, compRatio: 2.5, compMakeupDb: 2.5,
       doubler: 0, reverbSize: 35, reverbMix: 10, delayMs: 250, delayFb: 25, delayMix: 0,
     },
   },
@@ -132,10 +135,10 @@ export const BUILTIN_PRESETS: VocalPreset[] = [
     name: 'Pop Studio',
     isCustom: false,
     values: {
-      tuneAmt: 65, tuneSpeed: 50, formant: 0, gateThreshDb: -52, deesser: 30,
-      eqLowDb: 2, eqMidDb: 3, eqMidFreq: 3200, eqHighDb: 4.5,
-      compThreshDb: -18, compRatio: 3.5, compMakeupDb: 3.5,
-      doubler: 18, reverbSize: 55, reverbMix: 22, delayMs: 260, delayFb: 32, delayMix: 8,
+      tuneAmt: 65, tuneSpeed: 50, formant: 0, gateThreshDb: -52, deesser: 28,
+      eqLowDb: -1.0, eqMidDb: 3.0, eqMidFreq: 3000, eqHighDb: 4.0,
+      compThreshDb: -18, compRatio: 3.2, compMakeupDb: 3.5,
+      doubler: 12, reverbSize: 50, reverbMix: 20, delayMs: 260, delayFb: 32, delayMix: 8,
     },
   },
   {

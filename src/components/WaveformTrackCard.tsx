@@ -12,6 +12,31 @@ interface WaveformTrackCardProps {
   onDelete: (id: string) => void;
 }
 
+interface StaticWaveformBarsProps {
+  peaks: number[];
+  isVocal: boolean;
+}
+
+const StaticWaveformBars = React.memo<StaticWaveformBarsProps>(({ peaks, isVocal }) => (
+  <div className="w-full h-full flex items-center gap-[2px]">
+    {peaks.map((pk, idx) => {
+      const heightPct = Math.max(8, Math.min(92, pk * 92));
+      return (
+        <div
+          key={idx}
+          className={`flex-1 rounded-full ${
+            isVocal
+              ? 'bg-[#D97706]/45 dark:bg-[#FFB347]/40'
+              : 'bg-[#0284C7]/45 dark:bg-[#5CD0E6]/40'
+          }`}
+          style={{ height: `${heightPct}%` }}
+        />
+      );
+    })}
+  </div>
+));
+StaticWaveformBars.displayName = 'StaticWaveformBars';
+
 export const WaveformTrackCard: React.FC<WaveformTrackCardProps> = ({
   track,
   playheadSec,
@@ -79,27 +104,17 @@ export const WaveformTrackCard: React.FC<WaveformTrackCardProps> = ({
         aria-valuemax={Math.round(track.durationSec)}
         aria-valuenow={Math.round(effectivePlayhead)}
         tabIndex={0}
-        className="relative h-14 w-full bg-slate-100 dark:bg-[#0B0F1A] border border-slate-200 dark:border-white/8 rounded-lg px-2 flex items-center gap-[2px] cursor-pointer overflow-hidden"
+        className="relative h-14 w-full bg-slate-100 dark:bg-[#0B0F1A] border border-slate-200 dark:border-white/8 rounded-lg px-2 flex items-center cursor-pointer overflow-hidden"
       >
-        {track.peaks.map((pk, idx) => {
-          const passed = idx / track.peaks.length <= progress;
-          const heightPct = Math.max(8, Math.min(92, pk * 92));
-          return (
-            <div
-              key={idx}
-              className={`flex-1 rounded-full transition-colors duration-75 ${
-                track.isVocal
-                  ? passed
-                    ? 'bg-[#D97706] dark:bg-[#FFB347]'
-                    : 'bg-[#D97706]/30 dark:bg-[#FFB347]/25'
-                  : passed
-                  ? 'bg-[#0284C7] dark:bg-[#5CD0E6]'
-                  : 'bg-[#0284C7]/30 dark:bg-[#5CD0E6]/25'
-              }`}
-              style={{ height: `${heightPct}%` }}
-            />
-          );
-        })}
+        <div
+          className={`pointer-events-none absolute inset-y-0 left-0 ${
+            track.isVocal
+              ? 'bg-[#D97706]/15 dark:bg-[#FFB347]/15'
+              : 'bg-[#0284C7]/15 dark:bg-[#5CD0E6]/15'
+          }`}
+          style={{ width: `${progress * 100}%` }}
+        />
+        <StaticWaveformBars peaks={track.peaks} isVocal={track.isVocal} />
         <div
           className="pointer-events-none absolute top-0 bottom-0 w-[2px] bg-slate-900 dark:bg-white"
           style={{ left: `${progress * 100}%` }}
@@ -153,7 +168,7 @@ export const WaveformTrackCard: React.FC<WaveformTrackCardProps> = ({
           min={0}
           max={150}
           unit=" %"
-          defaultValue={100}
+          defaultValue={track.isVocal ? 110 : 68}
           accent={track.isVocal ? 'amber' : 'cyan'}
           onChange={(v) => onUpdate(track.id, { volume: v / 100 })}
         />

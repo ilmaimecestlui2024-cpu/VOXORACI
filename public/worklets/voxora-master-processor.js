@@ -31,6 +31,9 @@ class MasterBiquad {
       B0 = A * (A + 1 - (A - 1) * c + sq); B1 = 2 * A * (A - 1 - (A + 1) * c);
       B2 = A * (A + 1 - (A - 1) * c - sq); A0 = A + 1 + (A - 1) * c + sq;
       A1 = -2 * (A - 1 + (A + 1) * c); A2 = A + 1 + (A - 1) * c - sq;
+    } else if (type === 1) {
+      B0 = 1 + al * A; B1 = -2 * c; B2 = 1 - al * A;
+      A0 = 1 + al / A; A1 = -2 * c; A2 = 1 - al / A;
     } else if (type === 2) {
       B0 = A * (A + 1 + (A - 1) * c + sq); B1 = -2 * A * (A - 1 + (A + 1) * c);
       B2 = A * (A + 1 + (A - 1) * c - sq); A0 = A + 1 - (A - 1) * c + sq;
@@ -52,14 +55,38 @@ class VoxoraMasterProcessor extends AudioWorkletProcessor {
 
     this.eqLowDb = 0;
     this.eqHighDb = 1;
-    this.glueThreshDb = -14;
-    this.glueRatio = 2.5;
-    this.glueMix = 0.35;
+    this.glueThreshDb = -12;
+    this.glueRatio = 2.2;
+    this.glueMix = 0.28;
     this.exciter = 0.15;
-    this.stereoWidth = 1.08;
+    this.stereoWidth = 1.05;
     this.limiterCeilingDb = -1.0;
-    this.limiterDriveDb = 1.5;
+    this.limiterDriveDb = 1.2;
     this.bypass = false;
+
+    // Smart Mix Separation: Beat Pocket EQ (320 Hz & 2.4 kHz) + Vocal Sidechain Ducking + Mono Check
+    this.mixBalance = true;
+    this.hasVocal = false;
+    this.monoCheck = false;
+
+    this.beatLowMidL = new MasterBiquad();
+    this.beatLowMidR = new MasterBiquad();
+    this.beatPresL = new MasterBiquad();
+    this.beatPresR = new MasterBiquad();
+    this.beatLowMidL.set(1, sr, 320, -1.8, 0.8);
+    this.beatLowMidR.set(1, sr, 320, -1.8, 0.8);
+    this.beatPresL.set(1, sr, 2400, -2.8, 0.75);
+    this.beatPresR.set(1, sr, 2400, -2.8, 0.75);
+
+    this.vocHpL = new MasterBiquad();
+    this.vocHpR = new MasterBiquad();
+    this.vocHpL.set(3, sr, 100, 0, 0.707);
+    this.vocHpR.set(3, sr, 100, 0, 0.707);
+
+    this.scAtk = 1 - Math.exp(-1 / (0.012 * sr));
+    this.scRel = 1 - Math.exp(-1 / (0.180 * sr));
+    this.scEnv = 0;
+    this.duckGain = 1;
 
     this.eqLowL = new MasterBiquad();
     this.eqLowR = new MasterBiquad();
@@ -90,10 +117,14 @@ class VoxoraMasterProcessor extends AudioWorkletProcessor {
     this.peakHold = 0;
     this.rmsSq = 0;
     this.countdown = 0;
+    this.disposed = false;
 
     this.port.onmessage = (e) => {
-      if (e.data && e.data.type === 'params') {
+      if (!e.data) return;
+      if (e.data.type === 'params') {
         Object.assign(this, e.data.data);
+      } else if (e.data.type === 'dispose') {
+        this.disposed = true;
       }
     };
   }
@@ -110,25 +141,64 @@ class VoxoraMasterProcessor extends AudioWorkletProcessor {
   }
 
   process(inputs, outputs) {
-    const input = inputs[0];
+    if (this.disposed) return false;
+    const beatIn = inputs[0];
+    const vocIn = inputs[1];
     const output = outputs[0];
     if (!output || output.length === 0) return true;
 
     const outL = output[0];
     const outR = output.length > 1 ? output[1] : outL;
-    const inL = input && input.length > 0 ? input[0] : null;
-    const inR = input && input.length > 1 ? input[1] : inL;
+    const bInL = beatIn && beatIn.length > 0 ? beatIn[0] : null;
+    const bInR = beatIn && beatIn.length > 1 ? beatIn[1] : bInL;
+    const vInL = vocIn && vocIn.length > 0 ? vocIn[0] : null;
+    const vInR = vocIn && vocIn.length > 1 ? vocIn[1] : vInL;
     const n = outL.length;
 
     this.updEq();
     const drive = Math.pow(10, this.limiterDriveDb / 20);
     const ceilLin = Math.pow(10, Math.max(-6, Math.min(-0.1, this.limiterCeilingDb)) / 20);
+    const pocketActive = this.mixBalance && this.hasVocal && !this.bypass;
 
     for (let i = 0; i < n; i++) {
-      let L = inL ? inL[i] : 0;
-      let R = inR ? inR[i] : L;
-      if (!Number.isFinite(L)) L = 0;
-      if (!Number.isFinite(R)) R = 0;
+      let bL = bInL ? bInL[i] : 0;
+      let bR = bInR ? bInR[i] : bL;
+      let vL = vInL ? vInL[i] : 0;
+      let vR = vInR ? vInR[i] : vL;
+      if (!Number.isFinite(bL)) bL = 0;
+      if (!Number.isFinite(bR)) bR = 0;
+      if (!Number.isFinite(vL)) vL = 0;
+      if (!Number.isFinite(vR)) vR = 0;
+
+      if (pocketActive) {
+        // 1. Clean 100 Hz HPF on vocal bus prevents low-end mud
+        vL = this.vocHpL.run(vL);
+        vR = this.vocHpR.run(vR);
+
+        // 2. Carve gentle 320 Hz & 2.4 kHz vocal pocket in the instrumental
+        bL = this.beatPresL.run(this.beatLowMidL.run(bL));
+        bR = this.beatPresR.run(this.beatLowMidR.run(bR));
+
+        // 3. Musical vocal-triggered sidechain ducking (up to -2.8 dB)
+        const vPk = Math.max(Math.abs(vL), Math.abs(vR));
+        this.scEnv += (vPk - this.scEnv) * (vPk > this.scEnv ? this.scAtk : this.scRel);
+        let targetDuck = 1.0;
+        if (this.scEnv > 0.01585) {
+          const overDb = 20 * Math.log10(this.scEnv / 0.01585);
+          const cutDb = Math.min(2.8, overDb * 0.22);
+          targetDuck = Math.pow(10, -cutDb / 20);
+        }
+        this.duckGain += (targetDuck - this.duckGain) * (targetDuck < this.duckGain ? this.scAtk : this.scRel);
+        bL *= this.duckGain;
+        bR *= this.duckGain;
+      } else {
+        this.duckGain += (1.0 - this.duckGain) * 0.01;
+        bL *= this.duckGain;
+        bR *= this.duckGain;
+      }
+
+      let L = bL + vL;
+      let R = bR + vR;
 
       if (!this.bypass) {
         L = this.eqHighL.run(this.eqLowL.run(L));
@@ -153,8 +223,13 @@ class VoxoraMasterProcessor extends AudioWorkletProcessor {
 
         const mid = (L + R) * 0.5;
         const side = (L - R) * 0.5 * this.stereoWidth;
-        L = (mid + side) * drive;
-        R = (mid - side) * drive;
+        if (this.monoCheck) {
+          L = mid * drive;
+          R = mid * drive;
+        } else {
+          L = (mid + side) * drive;
+          R = (mid - side) * drive;
+        }
 
         // Soft-knee analog saturation before lookahead limiter
         L = Math.tanh(L * 0.72) / 0.72;
@@ -175,6 +250,11 @@ class VoxoraMasterProcessor extends AudioWorkletProcessor {
         L = Math.max(-ceilLin, Math.min(ceilLin, delL * this.limGain));
         R = Math.max(-ceilLin, Math.min(ceilLin, delR * this.limGain));
       } else {
+        if (this.monoCheck) {
+          const mid = (L + R) * 0.5;
+          L = mid;
+          R = mid;
+        }
         L = Math.tanh(L * 0.9);
         R = Math.tanh(R * 0.9);
       }
